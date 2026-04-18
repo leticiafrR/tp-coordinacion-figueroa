@@ -26,9 +26,7 @@ from pika.exceptions import (
 
 
 class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
-
     def __init__(self, host, queue_name):
-
         self.queue_name = queue_name
         self.__call_function_with_error_mapping(self.__stablish_connection, host, queue_name)
 
@@ -62,8 +60,11 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
         self.channel.basic_consume(queue=self.queue_name, on_message_callback=callback, auto_ack=False)
 
     def start_consuming(self, on_message_callback):
-        self.__call_function_with_error_mapping(self.__reserve_receiver_resources, on_message_callback)
+        self.reserve_receiver_resources(on_message_callback)
         self.__call_function_with_error_mapping(self.channel.start_consuming)
+
+    def reserve_receiver_resources(self, on_message_callback):
+        self.__call_function_with_error_mapping(self.__reserve_receiver_resources, on_message_callback)
 
     def stop_consuming(self):
         self.__call_function_with_error_mapping(self.channel.stop_consuming)
@@ -81,10 +82,16 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
 
 class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
-    def __init__(self, host, exchange_name, routing_keys):
+    def __init__(self, host, exchange_name, routing_keys, channel=None):
         self.exchange_name = exchange_name
         self.routing_keys = routing_keys
-        self.__call_function_with_error_mapping(self.__stablish_connection, host, exchange_name)
+        self._owns_connection = channel is None
+        if channel is None:
+            self.__call_function_with_error_mapping(self.__stablish_connection, host, exchange_name)
+        else:
+            self.channel = channel
+            self.connection = getattr(channel, "connection", None)
+        self.__call_function_with_error_mapping(self.__configure_channel, exchange_name)
     
     @staticmethod
     def __call_function_with_error_mapping(func, *args, **kwargs):
@@ -101,8 +108,11 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
             ) from error
 
     def start_consuming(self, on_message_callback):
-        self.__call_function_with_error_mapping(self.__reserve_receiver_resources, on_message_callback)
+        self.reserve_receiver_resources(on_message_callback)
         self.__call_function_with_error_mapping(self.channel.start_consuming)
+
+    def reserve_receiver_resources(self, on_message_callback):
+        self.__call_function_with_error_mapping(self.__reserve_receiver_resources, on_message_callback)
 
     def stop_consuming(self):
         self.__call_function_with_error_mapping(self.channel.stop_consuming)
@@ -118,11 +128,17 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
             )
 
     def close(self):
-        self.__call_function_with_error_mapping(lambda: self.connection.close())
+        if self._owns_connection:
+            connection = getattr(self, "connection", None)
+            if connection and connection.is_open:
+                self.__call_function_with_error_mapping(lambda: connection.close())
 
     def __stablish_connection(self, host, exchange_name):
         self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
         self.channel = self.connection.channel()
+
+    def __configure_channel(self, exchange_name):
+        self.channel.basic_qos(prefetch_count=1, global_qos=True)
         self.channel.exchange_declare(exchange=exchange_name, exchange_type='direct')
 
     def __bind_all_routing_keys(self ):

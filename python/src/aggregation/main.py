@@ -1,6 +1,6 @@
 import os
 import logging
-import bisect
+import heapq
 
 from common import middleware, message_protocol, fruit_item
 
@@ -23,29 +23,46 @@ class AggregationFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        self.fruit_top_by_client_id = {}
+        self.fruit_items_by_client_id = {}
+        self.eof_count_by_client_id = {}
+        self.completed_client_ids = set()
 
     def _process_data(self, fruit, amount, client_id):
         logging.info("* Processing data message with fruit: %s and amount: %d from the client: %s", fruit, amount, client_id)
-        client_fruit_top = self.fruit_top_by_client_id.get(client_id, [])
-        for i in range(len(client_fruit_top)):
-            if client_fruit_top[i].fruit == fruit:
-                client_fruit_top[i] = client_fruit_top[i] + fruit_item.FruitItem(
-                    fruit, amount
-                )
-                self.fruit_top_by_client_id[client_id] = client_fruit_top
-                logging.warning("* In some MOMENT, aggregation filter received a fruit %s (summed previously) and updated the amount to: %d", client_fruit_top[i].fruit, client_fruit_top[i].amount)
-                return
-        # TODO
-        bisect.insort(client_fruit_top, fruit_item.FruitItem(fruit, amount))
-        self.fruit_top_by_client_id[client_id] = client_fruit_top
-        logging.info("* Aggregation filter received a fruit %s (not summed previously) and added it to the list of fruits with amount: %d", fruit, amount)
+        client_fruit_items = self.fruit_items_by_client_id.get(client_id, {})
+        current_fruit_item = client_fruit_items.get(fruit, fruit_item.FruitItem(fruit, 0))
+        updated_fruit_item = current_fruit_item + fruit_item.FruitItem(fruit, amount)
+        client_fruit_items[fruit] = updated_fruit_item
+        self.fruit_items_by_client_id[client_id] = client_fruit_items
+        logging.info(
+            "* Updated fruit %s amount to: %d for client: %s",
+            updated_fruit_item.fruit,
+            updated_fruit_item.amount,
+            client_id,
+        )
 
     def _process_eof(self, client_id):
-        logging.info("Received EOF from client: %s", client_id)
-        client_fruit_top = self.fruit_top_by_client_id.get(client_id, [])
-        fruit_chunk = list(client_fruit_top[-TOP_SIZE:])
-        fruit_chunk.reverse()
+        if client_id in self.completed_client_ids:
+            logging.info("Ignoring duplicated EOF for completed client: %s", client_id)
+            return
+
+        received_eof_count = self.eof_count_by_client_id.get(client_id, 0) + 1
+        self.eof_count_by_client_id[client_id] = received_eof_count
+
+        logging.info(
+            "Received EOF from client: %s (%d/%d)",
+            client_id,
+            received_eof_count,
+            SUM_AMOUNT,
+        )
+
+        if received_eof_count < SUM_AMOUNT:
+            return
+
+        client_fruit_items = self.fruit_items_by_client_id.get(client_id, {})
+        fruit_heap = list(client_fruit_items.values())
+        heapq.heapify(fruit_heap)
+        fruit_chunk = heapq.nlargest(TOP_SIZE, fruit_heap)
         fruit_top = list(
             map(
                 lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
@@ -58,9 +75,12 @@ class AggregationFilter:
         self.output_queue.send(
             message_protocol.internal.serialize(list_sending)
         )
-        #TODO: arreglar esto en el caso de múltiples aggregations pues este sería el eof de uno de los agg-filter
-        if client_id in self.fruit_top_by_client_id:
-            del self.fruit_top_by_client_id[client_id]
+
+        self.completed_client_ids.add(client_id)
+        if client_id in self.eof_count_by_client_id:
+            del self.eof_count_by_client_id[client_id]
+        if client_id in self.fruit_items_by_client_id:
+            del self.fruit_items_by_client_id[client_id]
 
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")
