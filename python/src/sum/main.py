@@ -41,11 +41,8 @@ class SumFilter:
         new_fruit_addition = fruit_item.FruitItem(fruit_name, int(amount))
         self.amount_by_client_id_by_fruit[client_id][fruit_name] = self.amount_by_client_id_by_fruit[client_id][fruit_name] + new_fruit_addition 
 
-
-    def _process_eof(self, client_id):
+    def _share_client_fruit_sums_one_by_one_to_aggs(self, client_id):
         fruit_items_by_client_id = self.amount_by_client_id_by_fruit.get(client_id, {})
-        if len(fruit_items_by_client_id) == 0:
-            logging.warning(f"No fruit items found for client_id: {client_id}")
         for final_fruit_item in fruit_items_by_client_id.values():
             logging.info("  fruit: %s, amount: %d", final_fruit_item.fruit, final_fruit_item.amount)
             for data_output_exchange in self.data_output_exchanges: # para el caso de un aggregatioN filter esto es equivalente a llamar una vez 
@@ -56,6 +53,8 @@ class SumFilter:
                 )
                 logging.info(f"   Sending to {data_output_exchange.exchange_name}")
 
+    def _process_eof(self, client_id):
+        self._share_client_fruit_sums_one_by_one_to_aggs(client_id)
         # TODO: revisar si es que es necesario enviarle a todos los data_output_exchanges.
         for data_output_exchange in self.data_output_exchanges:
             data_output_exchange.send(message_protocol.internal.serialize([client_id]))
@@ -82,6 +81,7 @@ class SumFilter:
         elif len(fields) == 1:
             client_id = fields[0]
             self._process_eof(client_id)
+
             self._broadcast_eof_to_other_sums(client_id)
         else:
             logging.error(f"Received a message with an unexpected format: {message}")
