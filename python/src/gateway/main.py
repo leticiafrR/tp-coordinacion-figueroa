@@ -14,28 +14,15 @@ INPUT_QUEUE = os.environ["INPUT_QUEUE"]
 OUTPUT_QUEUE = os.environ["OUTPUT_QUEUE"]
 
 
-def configure_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(processName)s %(levelname)s %(message)s",
-        force=True,
-    )
-    logging.getLogger("pika").setLevel(logging.WARNING)
-    logging.getLogger("amqp").setLevel(logging.WARNING)
-
-
 def handle_client_request(client_socket, message_handler):
-    configure_logging()
     output_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, OUTPUT_QUEUE)
 
     try:
         while True:
             message = message_protocol.external.recv_msg(client_socket)
-            logging.info("Received a message from the client: %s", message)
 
             if message[0] == message_protocol.external.MsgType.FRUIT_RECORD:
                 serialized_message = message_handler.serialize_data_message(message[1])
-                logging.info("Sending a message to the results queue: %s", serialized_message)
                 output_queue.send(serialized_message)
                 message_protocol.external.send_msg(
                     client_socket, message_protocol.external.MsgType.ACK
@@ -57,22 +44,17 @@ def handle_client_request(client_socket, message_handler):
 
 
 def handle_client_response(client_list):
-    configure_logging()
     input_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
-    logging.info("Other sub-process is listening to results queue")
 
-    # esto se envía a la cola en particular para que se sume, supongo que hay una condición para dejar de sumar? veamo 
     def _consume_result(message, ack, nack):
         client_index = 0
         try:
-            # TODO: aquí es donde se recorre la lista
             for [message_handler_instance, client_socket] in client_list:
                 deserialized_message = (
                     message_handler_instance.deserialize_result_message(message)
                 )
-                logging.info("\n\nReceived a message from the results queue: %s", deserialized_message)
 
-                if not deserialized_message: # si es que no hay resultados
+                if not deserialized_message:
                     client_index += 1
                     continue
 
@@ -106,13 +88,12 @@ def handle_sigterm(server_socket, client_list, sigterm_received):
 
 
 def main():
-    configure_logging()
+    logging.basicConfig(level=logging.INFO)
 
     with multiprocessing.Manager() as manager:
         client_list = manager.list()
         sigterm_received = manager.Value("c_short", 0)
-        cant_cores_allowed_to_use = os.process_cpu_count()
-        with multiprocessing.Pool(processes=cant_cores_allowed_to_use) as processes_pool:
+        with multiprocessing.Pool(processes=os.process_cpu_count()) as processes_pool:
             processes_pool.apply_async(handle_client_response, (client_list,))
 
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
@@ -131,7 +112,6 @@ def main():
 
                         logging.info("A new client has connected")
                         message_handler_instance = message_handler.MessageHandler()
-                        # TODO: actualmente este proceso edita la lista mientras que otro proceso podría recorrerlo (handle_client_response)=> puede generar inconsistencias
                         client_list.append([message_handler_instance, client_socket])
                         processes_pool.apply_async(
                             handle_client_request,
