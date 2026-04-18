@@ -25,7 +25,6 @@ class AggregationFilter:
         )
         self.fruit_items_by_client_id = {}
         self.eof_count_by_client_id = {}
-        self.completed_client_ids = set()
 
     def _process_data(self, fruit, amount, client_id):
         logging.info("* Processing data message with fruit: %s and amount: %d from the client: %s", fruit, amount, client_id)
@@ -40,11 +39,7 @@ class AggregationFilter:
             updated_fruit_item.amount,
             client_id,
         )
-
-    def _process_eof(self, client_id):
-        if client_id in self.completed_client_ids:
-            logging.info("Ignoring duplicated EOF for completed client: %s", client_id)
-            return
+    def _should_calculate_top(self, client_id):
         received_eof_count = self.eof_count_by_client_id.get(client_id, 0) + 1
         self.eof_count_by_client_id[client_id] = received_eof_count
         logging.info(
@@ -53,21 +48,22 @@ class AggregationFilter:
             received_eof_count,
             SUM_AMOUNT,
         )
+        return received_eof_count >= SUM_AMOUNT
 
-        if received_eof_count < SUM_AMOUNT:
+    def _process_eof(self, client_id):
+        if not self._should_calculate_top(client_id):
             return
-
         client_fruit_items = self.fruit_items_by_client_id.get(client_id, {})
         list_sending = [self._find_top_fruits(client_fruit_items), client_id]
         logging.info("* The message is "+str(list_sending))
         self.output_queue.send(
-            message_protocol.internal.serialize(list_sending)
+            message_protocol.internal.serialize(list_sending) # intermedio
         )
-        self.completed_client_ids.add(client_id)
         if client_id in self.eof_count_by_client_id:
             del self.eof_count_by_client_id[client_id]
         if client_id in self.fruit_items_by_client_id:
             del self.fruit_items_by_client_id[client_id]
+
 
     def _find_top_fruits(self, client_fruit_items):
         top_heap = []
