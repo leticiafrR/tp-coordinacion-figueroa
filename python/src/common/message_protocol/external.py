@@ -11,6 +11,7 @@ class MsgType:
 
 
 def _recv_sized(socket, size):
+    #TODO: agregar un númerode intentos
     """
     Receives exactly 'num_bytes' bytes through the provided socket.
     If no bytes are read from the socket IncompleteReadError is raised
@@ -25,7 +26,7 @@ def _recv_sized(socket, size):
     return bytes(buf)
 
 
-def _recv_fruit_record(socket):
+def _recv_fruit_record(socket)-> tuple[str, int]:
     fruit_size = external_serializer.deserialize_uint32(
         _recv_sized(socket, external_serializer.UINT32_SIZE)
     )
@@ -36,7 +37,7 @@ def _recv_fruit_record(socket):
     return (fruit, amount)
 
 
-def _recv_fruit_top(socket):
+def _recv_fruit_top(socket)-> list[tuple[str, int]]:
     fruit_top_size = external_serializer.deserialize_uint32(
         _recv_sized(socket, external_serializer.UINT32_SIZE)
     )
@@ -107,6 +108,8 @@ SEND_MSG_HANDLERS = {
 }
 
 
-def send_msg(socket, msg_type, *args):
+def send_msg(socket, msg_type, *args, logger=None):
+    if logger is not None:
+        logger.info("Sending message | type=%s args=%s", msg_type, args)
     msg_handler = SEND_MSG_HANDLERS[msg_type]
     msg_handler(socket, *args)

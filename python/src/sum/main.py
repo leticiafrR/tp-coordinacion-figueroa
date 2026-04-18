@@ -1,6 +1,5 @@
 import os
 import logging
-import threading
 
 from common import middleware, message_protocol, fruit_item
 
@@ -9,14 +8,21 @@ MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
 SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
 SUM_PREFIX = os.environ["SUM_PREFIX"]
-SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
+SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"#common for all the sum filters, they use them for subscribing
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
+SUM_CONTROL_ROUTING_KEY = f"{SUM_CONTROL_EXCHANGE}_ALL"
 
 class SumFilter:
     def __init__(self):
-        self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
+        self.data_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
+        )
+        self.sum_control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST,
+            SUM_CONTROL_EXCHANGE,
+            [SUM_CONTROL_ROUTING_KEY],
+            channel=self.data_queue.channel,
         )
         self.data_output_exchanges = []
         logging.info("There will be creating %d exchanges with the next configuration", AGGREGATION_AMOUNT)
@@ -38,7 +44,6 @@ class SumFilter:
         new_fruit_addition = fruit_item.FruitItem(fruit_name, int(amount))
         self.amount_by_client_id_by_fruit[client_id][fruit_name] = self.amount_by_client_id_by_fruit[client_id][fruit_name] + new_fruit_addition 
         logging.info(f"-> Added fruit already registered: {self.amount_by_client_id_by_fruit[client_id][fruit_name].fruit}, new amount {self.amount_by_client_id_by_fruit[client_id][fruit_name].amount}")
-
 
 
     def _process_eof(self, client_id):
@@ -63,18 +68,39 @@ class SumFilter:
         for data_output_exchange in self.data_output_exchanges:
             data_output_exchange.send(message_protocol.internal.serialize([client_id]))
 
+        # now broadcast to the rest of sum workers so they send their results
+
+    def _broadcast_eof_to_other_sums(self, client_id):
+        self.sum_control_exchange.send(
+            message_protocol.internal.serialize(["sum_eof", client_id, ID])
+        )
+
+    def process_control_message(self, message, ack, nack):
+        fields = message_protocol.internal.deserialize(message)
+        if len(fields) == 3 and fields[0] == "sum_eof":
+            _, client_id, sender_id = fields
+            if int(sender_id) != ID:
+                self._process_eof(client_id)
+        else:
+            logging.error(f"Received a control message with an unexpected format: {message}")
+        ack()
+
     def process_data_messsage(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 3:
             self._process_data(*fields)
         elif len(fields) == 1:
-            self._process_eof(*fields)
+            client_id = fields[0]
+            self._process_eof(client_id)
+            self._broadcast_eof_to_other_sums(client_id)
         else:
             logging.error(f"Received a message with an unexpected format: {message}")
         ack()
 
     def start(self):
-        self.input_queue.start_consuming(self.process_data_messsage)
+        self.data_queue.reserve_receiver_resources(self.process_data_messsage)
+        self.sum_control_exchange.reserve_receiver_resources(self.process_control_message)
+        self.data_queue.channel.start_consuming()
 
 def log_env():
     logging.info(f"ID: {ID}")
