@@ -43,11 +43,11 @@ class SumFilter:
         self.amount_by_client_id_by_fruit[client_id][fruit_name] = self.amount_by_client_id_by_fruit[client_id][fruit_name] + new_fruit_addition 
 
     def _calculate_routing_key(self, fruit_name, client_id):
-        assert SUM_AMOUNT > 0, "SUM_AMOUNT must be greater than 0 to calculate routing key"
+        assert AGGREGATION_AMOUNT > 0, "AGGREGATION_AMOUNT must be greater than 0 to calculate routing key"
         key = f"{fruit_name}:{client_id}"
         digest = hashlib.sha256(key.encode("utf-8")).digest()
         hash_value = int.from_bytes(digest[:8], byteorder="big", signed=False)
-        return hash_value % SUM_AMOUNT
+        return hash_value % AGGREGATION_AMOUNT
 
 
     def _share_client_fruit_sums_one_by_one_to_aggs(self, client_id):
