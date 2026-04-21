@@ -16,15 +16,8 @@ SUM_CONTROL_ROUTING_KEY = f"{SUM_CONTROL_EXCHANGE}_ALL"
 
 class SumFilter:
     def __init__(self):
-        self.data_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-            MOM_HOST, INPUT_QUEUE
-        )
-        self.sum_control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST,
-            SUM_CONTROL_EXCHANGE,
-            [SUM_CONTROL_ROUTING_KEY],
-            channel=self.data_queue.channel,
-        )
+        self.data_queue = None
+        self.sum_control_exchange = None
         self.data_output_exchanges = []
         for i in range(AGGREGATION_AMOUNT):
             data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
@@ -32,6 +25,43 @@ class SumFilter:
             )
             self.data_output_exchanges.append(data_output_exchange)
         self.amount_by_client_id_by_fruit = {}
+
+    def process_control_message(self, message, ack, nack):
+        fields = message_protocol.internal.deserialize(message)
+        if len(fields) == 1:
+            [client_id] = fields
+            self._process_eof(client_id)
+        else:
+            logging.error(f"Received a control message with an unexpected format: {message}")
+        ack()
+
+    def process_data_message(self, message, ack, nack):
+        fields = message_protocol.internal.deserialize(message)
+        if len(fields) == 3:
+            self._process_data(*fields)
+        elif len(fields) == 1:
+            client_id = fields[0]
+            self._broadcast_eof_to_other_sums(client_id)
+        else:
+            logging.error(f"Received a message with an unexpected format: {message}")
+        ack()
+
+    def start(self):
+        with middleware.SharedChannelAdapter(MOM_HOST) as shared_adapter:
+            self.data_queue = middleware.MessageMiddlewareQueueRabbitMQ(
+                MOM_HOST,
+                INPUT_QUEUE,
+                shared_adapter=shared_adapter,
+            )
+            self.sum_control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+                MOM_HOST,
+                SUM_CONTROL_EXCHANGE,
+                [SUM_CONTROL_ROUTING_KEY],
+                shared_adapter=shared_adapter,
+            )
+            self.data_queue.start_consuming(self.process_data_message)
+            self.sum_control_exchange.start_consuming(self.process_control_message)
+
 
     def _process_data(self, fruit_name, amount, client_id):
         if client_id not in self.amount_by_client_id_by_fruit:
@@ -68,43 +98,13 @@ class SumFilter:
             data_output_exchange.send(message_protocol.internal.serialize([client_id]))
 
     def _broadcast_eof_to_other_sums(self, client_id):
+        if self.sum_control_exchange is None:
+            logging.error("Cannot broadcast EOF: sum control exchange is not initialized")
+            return
         self.sum_control_exchange.send(
             message_protocol.internal.serialize([client_id])
         )
 
-    def process_control_message(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 1:
-            [client_id] = fields
-            self._process_eof(client_id)
-        else:
-            logging.error(f"Received a control message with an unexpected format: {message}")
-        ack()
-
-    def process_data_message(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 3:
-            self._process_data(*fields)
-        elif len(fields) == 1:
-            client_id = fields[0]
-            self._broadcast_eof_to_other_sums(client_id)
-        else:
-            logging.error(f"Received a message with an unexpected format: {message}")
-        ack()
-
-    def start(self):
-        self.data_queue.reserve_receiver_resources(self.process_data_message)
-        self.sum_control_exchange.reserve_receiver_resources(self.process_control_message)
-        self.data_queue.channel.start_consuming()
-
-def log_env():
-    logging.info(f"ID: {ID}")
-    logging.info(f"MOM_HOST: {MOM_HOST}")
-    logging.info(f"INPUT_QUEUE: {INPUT_QUEUE}")
-    logging.info(f"SUM_AMOUNT: {SUM_AMOUNT}")
-    logging.info(f"SUM_PREFIX: {SUM_PREFIX}")
-    logging.info(f"AGGREGATION_AMOUNT: {AGGREGATION_AMOUNT}")
-    logging.info(f"AGGREGATION_PREFIX: {AGGREGATION_PREFIX}")
 
 def main():
     logging.basicConfig(level=logging.INFO)
