@@ -108,8 +108,6 @@ def log_env():
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    logging.getLogger("pika").setLevel(logging.WARNING)
-    log_env()
     sum_filter = SumFilter()
     sum_filter.start()
     return 0
