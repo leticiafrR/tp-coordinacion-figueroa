@@ -92,20 +92,6 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
             self.channel = channel
             self.connection = getattr(channel, "connection", None)
         self.__call_function_with_error_mapping(self.__configure_channel, exchange_name)
-    
-    @staticmethod
-    def __call_function_with_error_mapping(func, *args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except (ChannelClosed, ChannelClosedByBroker, ChannelClosedByClient, ChannelWrongStateError,
-                ConnectionClosed, ConnectionClosedByBroker, ConnectionClosedByClient, ConnectionWrongStateError) as error:
-            raise MessageMiddlewareCloseError("RabbitMQ channel or connection was closed") from error
-        except (AMQPConnectionError, StreamLostError) as error:
-            raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ") from error
-        except AMQPError as error:
-            raise MessageMiddlewareMessageError(
-                f"Failed to execute RabbitMQ operation: {str(error)}"
-            ) from error
 
     def start_consuming(self, on_message_callback):
         self.reserve_receiver_resources(on_message_callback)
@@ -132,13 +118,27 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
             connection = getattr(self, "connection", None)
             if connection and connection.is_open:
                 self.__call_function_with_error_mapping(lambda: connection.close())
+    
+    @staticmethod
+    def __call_function_with_error_mapping(func, *args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except (ChannelClosed, ChannelClosedByBroker, ChannelClosedByClient, ChannelWrongStateError,
+                ConnectionClosed, ConnectionClosedByBroker, ConnectionClosedByClient, ConnectionWrongStateError) as error:
+            raise MessageMiddlewareCloseError("RabbitMQ channel or connection was closed") from error
+        except (AMQPConnectionError, StreamLostError) as error:
+            raise MessageMiddlewareDisconnectedError("Failed to connect to RabbitMQ") from error
+        except AMQPError as error:
+            raise MessageMiddlewareMessageError(
+                f"Failed to execute RabbitMQ operation: {str(error)}"
+            ) from error
 
     def __stablish_connection(self, host, exchange_name):
         self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
         self.channel = self.connection.channel()
 
     def __configure_channel(self, exchange_name):
-        self.channel.basic_qos(prefetch_count=1, global_qos=True)
+        # self.channel.basic_qos(prefetch_count=1, global_qos=True)
         self.channel.exchange_declare(exchange=exchange_name, exchange_type='direct')
 
     def __bind_all_routing_keys(self ):
