@@ -39,6 +39,7 @@ class AggregationFilter:
             updated_fruit_item.amount,
             client_id,
         )
+
     def _should_calculate_top(self, client_id):
         received_eof_count = self.eof_count_by_client_id.get(client_id, 0) + 1
         self.eof_count_by_client_id[client_id] = received_eof_count
@@ -57,7 +58,7 @@ class AggregationFilter:
         list_sending = [self._find_top_fruits(client_fruit_items), client_id]
         logging.info("* The message is "+str(list_sending))
         self.output_queue.send(
-            message_protocol.internal.serialize(list_sending) # intermedio
+            message_protocol.internal.serialize(list_sending)
         )
         if client_id in self.eof_count_by_client_id:
             del self.eof_count_by_client_id[client_id]
