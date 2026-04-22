@@ -25,7 +25,6 @@ class AggregationFilter:
         )
         self.fruit_items_by_client_id = {}
         self.eof_count_by_client_id = {}
-        self.completed_client_ids = set()
 
     def _process_data(self, fruit, amount, client_id):
         logging.info("* Processing data message with fruit: %s and amount: %d from the client: %s", fruit, amount, client_id)
@@ -41,46 +40,43 @@ class AggregationFilter:
             client_id,
         )
 
-    def _process_eof(self, client_id):
-        if client_id in self.completed_client_ids:
-            logging.info("Ignoring duplicated EOF for completed client: %s", client_id)
-            return
-
+    def _should_calculate_top(self, client_id):
         received_eof_count = self.eof_count_by_client_id.get(client_id, 0) + 1
         self.eof_count_by_client_id[client_id] = received_eof_count
-
         logging.info(
             "Received EOF from client: %s (%d/%d)",
             client_id,
             received_eof_count,
             SUM_AMOUNT,
         )
+        return received_eof_count >= SUM_AMOUNT
 
-        if received_eof_count < SUM_AMOUNT:
+    def _process_eof(self, client_id):
+        if not self._should_calculate_top(client_id):
             return
-
         client_fruit_items = self.fruit_items_by_client_id.get(client_id, {})
-        fruit_heap = list(client_fruit_items.values())
-        heapq.heapify(fruit_heap)
-        fruit_chunk = heapq.nlargest(TOP_SIZE, fruit_heap)
-        fruit_top = list(
-            map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
-                fruit_chunk,
-            )
-        )
-        logging.info("Sending the fruit top: %s for client: %s to the results queue", fruit_top, client_id)
-        list_sending = [fruit_top, client_id]
+        list_sending = [self._find_top_fruits(client_fruit_items), client_id]
         logging.info("* The message is "+str(list_sending))
         self.output_queue.send(
             message_protocol.internal.serialize(list_sending)
         )
-
-        self.completed_client_ids.add(client_id)
         if client_id in self.eof_count_by_client_id:
             del self.eof_count_by_client_id[client_id]
         if client_id in self.fruit_items_by_client_id:
             del self.fruit_items_by_client_id[client_id]
+
+
+    def _find_top_fruits(self, client_fruit_items):
+        top_heap = []
+        for item in client_fruit_items.values():
+            if len(top_heap) < TOP_SIZE:
+                heapq.heappush(top_heap, item)
+            elif item > top_heap[0]:
+                heapq.heapreplace(top_heap, item)
+
+        fruit_chunk = sorted(top_heap, reverse=True)
+        logging.info(f"Top fruits for client: {fruit_chunk}")
+        return [(fi.fruit, fi.amount) for fi in fruit_chunk]
 
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")
@@ -95,7 +91,6 @@ class AggregationFilter:
 
     def start(self):
         self.input_exchange.start_consuming(self.process_messsage)
-
 
 def main():
     logging.basicConfig(level=logging.INFO)
