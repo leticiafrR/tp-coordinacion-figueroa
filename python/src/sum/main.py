@@ -39,8 +39,13 @@ class SumFilter:
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 3:
             self._process_data(*fields)
-        elif len(fields) == 1:
-            client_id = fields[0]
+        elif len(fields) == 2:
+            [client_id, total_serialized_data_messages] = fields
+            logging.info(
+                "Received EOF from client %s with total serialized data messages: %s",
+                client_id,
+                total_serialized_data_messages,
+            )
             self._broadcast_eof_to_other_sums(client_id)
         else:
             logging.error(f"Received a message with an unexpected format: {message}")
