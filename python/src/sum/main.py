@@ -2,13 +2,12 @@ import os
 import logging
 import hashlib
 import threading
-import queue
 from transaction.transactions import TransactionsMonitor
 from transaction.active_transactions import MastersRoutingKeyByTransactionId
 from digest import DigestPool
 from control_plane_sender import ControlPlaneSender
+from control_plane_receiver import ControlPlaneReceiver
 from common import middleware, message_protocol, fruit_item
-from common.message_protocol.internal import ControlMsgType
 
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
@@ -38,98 +37,17 @@ class SumFilter:
             )
             self.data_output_exchanges.append(data_output_exchange)
 
-        self.control_handlers = self._make_control_handlers()
-
-    def _make_control_handlers(self):
-        return {
-            ControlMsgType.COMMIT: self._process_control_commit,
-            ControlMsgType.TRYING_READY: self._process_control_trying_ready,
-            ControlMsgType.OK: self._process_control_ok,
-        }
-
-    def _maybe_broadcast_ok(self, transaction_id):
-        if self.transactions_monitor.digestion_complete(transaction_id):
-            self.control_plane_sender._enqueue_control_broadcast(
-                message_protocol.internal.make_ok(transaction_id)
-            )
-
-    def _send_digest_to_aggregators(self, transaction_id):
-        current_digest = self.digest_pool.get_current_client_digest(transaction_id)
-        for fruit_name, amount in current_digest.data_per_fruit.items():
-            exchange_to_use_idx = self._calculate_routing_key(fruit_name, transaction_id)
-            self.data_output_exchanges[exchange_to_use_idx].send(
-                message_protocol.internal.serialize([fruit_name, amount, transaction_id])
-            )
-
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([transaction_id]))
-
-        self.digest_pool.delete_client_digest(transaction_id)
-        self.transactions_monitor.delete_transaction(transaction_id)
-        self.masters_routing_key_by_transaction_id.delete_transaction_info(transaction_id)
-
-    def _process_control_commit(self, message):
-        transaction_id = message["transaction_id"]
-        master_routing_key = message["master_routing_key"]
-        self.masters_routing_key_by_transaction_id.register_transaction_master_routing_key(
-            transaction_id,
-            master_routing_key,
+        self.control_plane_receiver = ControlPlaneReceiver(
+            MOM_HOST,
+            SUM_CONTROL_EXCHANGE,
+            SUM_CONTROL_ROUTING_KEY,
+            self.control_plane_sender,
+            self.transactions_monitor,
+            self.digest_pool,
+            self.masters_routing_key_by_transaction_id,
+            self.data_output_exchanges,
+            self._calculate_routing_key,
         )
-
-        current_digest = self.digest_pool.get_current_client_digest(transaction_id)
-        self.control_plane_sender._enqueue_control_direct(
-            master_routing_key,
-            message_protocol.internal.make_trying_ready(
-                transaction_id=transaction_id,
-                amount_fruits_processed=current_digest.cant_data_processed,
-            ),
-        )
-
-    def _process_control_trying_ready(self, message):
-        transaction_id = message["transaction_id"]
-        amount_fruits_processed = int(message["amount_fruits_processed"])
-
-        added = self.transactions_monitor.add_processed_data_count(
-            amount_fruits_processed,
-            transaction_id,
-        )
-        if not added:
-            logging.error(
-                "Received TryingReady for an unknown transaction: %s", transaction_id
-            )
-            return
-
-        self._maybe_broadcast_ok(transaction_id)
-
-    def _process_control_ok(self, message):
-        transaction_id = message["transaction_id"]
-        self._send_digest_to_aggregators(transaction_id)
-
-    def _process_control_message(self, message, ack, nack):
-        try:
-            decoded_message = message_protocol.internal.deserialize(message)
-            if not isinstance(decoded_message, list) or len(decoded_message) == 0:
-                logging.error("Received malformed control message: %s", decoded_message)
-                nack()
-                return
-
-            message_type = message_protocol.internal.get_control_message_type(decoded_message)
-            normalized_message = message_protocol.internal.parse_control_message(decoded_message)
-            if normalized_message is None:
-                logging.error("Received malformed control message: %s", decoded_message)
-                nack()
-                return
-
-            handler = self.control_handlers.get(message_type)
-            if handler:
-                handler(normalized_message)
-            else:
-                logging.error("Unknown control message type: %s", message_type)
-            
-            ack()
-        except Exception as error:
-            logging.error("Error while processing control message: %s", error)
-            nack()
 
     def _process_data(self, fruit_name, amount, client_id):
         self.digest_pool.digest_client_data(client_id, fruit_name, int(amount))
@@ -169,7 +87,7 @@ class SumFilter:
                 master_routing_key=master_routing_key,
             )
         )
-        self._maybe_broadcast_ok(client_id)
+        self.control_plane_receiver.maybe_broadcast_ok(client_id)
 
     def _process_data_message(self, message, ack, nack):
         try:
@@ -190,14 +108,6 @@ class SumFilter:
         data_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
         data_queue.start_consuming(self._process_data_message)
 
-    def _run_control_plane_receiver(self):
-        control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST,
-            SUM_CONTROL_EXCHANGE,
-            [SUM_CONTROL_ROUTING_KEY],
-        )
-        control_exchange.start_consuming(self._process_control_message)
-
     def start(self):
         self.control_sender_thread = threading.Thread(
             target=self.control_plane_sender.run,
@@ -207,7 +117,7 @@ class SumFilter:
         self.control_sender_thread.start()
 
         self.control_receiver_thread = threading.Thread(
-            target=self._run_control_plane_receiver,
+            target=self.control_plane_receiver.run,
             daemon=False,
             name=f"sum-{ID}-control-receiver",
         )
