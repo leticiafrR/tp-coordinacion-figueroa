@@ -3,7 +3,9 @@ import logging
 import hashlib
 import threading
 import queue
-
+from transaction.transactions import TransactionsMonitor
+from transaction.active_transactions import MastersRoutingKeyByTransactionId
+from digest import DigestPool
 from common import middleware, message_protocol, fruit_item
 
 ID = int(os.environ["ID"])
@@ -15,106 +17,6 @@ SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 SUM_CONTROL_ROUTING_KEY = f"{ID}_control_routing_key"
-
-
-class TransactionStatus:
-    def __init__(self, expected_processed_data_count):
-        self.expected_processed_data_count = int(expected_processed_data_count)
-        self.current_processed_data_count = 0
-
-
-class TransactionsMonitor:
-    def __init__(self):
-        self.transactions = {}
-        self.mutex = threading.Lock()
-
-    def begin_transaction(self, client_id, expected_data_count):
-        with self.mutex:
-            if client_id not in self.transactions:
-                self.transactions[client_id] = TransactionStatus(expected_data_count)
-            else:
-                self.transactions[client_id].expected_processed_data_count = int(
-                    expected_data_count
-                )
-
-    def add_processed_data_count(self, processed_data_count, transaction_id):
-        with self.mutex:
-            status = self.transactions.get(transaction_id)
-            if status is None:
-                return False
-            status.current_processed_data_count += int(processed_data_count)
-            return True
-
-    def digestion_complete(self, transaction_id):
-        with self.mutex:
-            status = self.transactions.get(transaction_id)
-            if status is None:
-                return False
-            return (
-                status.current_processed_data_count
-                == status.expected_processed_data_count
-            )
-
-    def delete_transaction(self, transaction_id):
-        with self.mutex:
-            self.transactions.pop(transaction_id, None)
-
-
-class ClientDigest:
-    def __init__(self):
-        self.cant_data_processed = 0
-        self.data_per_fruit = {}
-
-    def digest(self, fruit, amount):
-        self.cant_data_processed += 1
-        current_amount = self.data_per_fruit.get(fruit, 0)
-        self.data_per_fruit[fruit] = current_amount + int(amount)
-
-
-class DigestPool:
-    def __init__(self):
-        self.pool = {}
-        self.mutex = threading.Lock()
-
-    def digest_client_data(self, client_id, fruit, amount):
-        with self.mutex:
-            client_digest = self.pool.get(client_id)
-            if client_digest is None:
-                client_digest = ClientDigest()
-                self.pool[client_id] = client_digest
-            client_digest.digest(fruit, amount)
-
-    def get_current_client_digest(self, client_id):
-        with self.mutex:
-            client_digest = self.pool.get(client_id)
-            if client_digest is None:
-                return ClientDigest()
-            snapshot = ClientDigest()
-            snapshot.cant_data_processed = client_digest.cant_data_processed
-            snapshot.data_per_fruit = dict(client_digest.data_per_fruit)
-            return snapshot
-
-    def delete_client_digest(self, client_id):
-        with self.mutex:
-            self.pool.pop(client_id, None)
-
-
-class MastersRoutingKeyByTransactionId:
-    def __init__(self):
-        self.routing_key_by_transaction_id = {}
-        self.mutex = threading.Lock()
-
-    def register_transaction_master_routing_key(self, transaction_id, routing_key):
-        with self.mutex:
-            self.routing_key_by_transaction_id[transaction_id] = routing_key
-
-    def look_master_routing_key(self, transaction_id):
-        with self.mutex:
-            return self.routing_key_by_transaction_id.get(transaction_id)
-
-    def delete_transaction_info(self, transaction_id):
-        with self.mutex:
-            self.routing_key_by_transaction_id.pop(transaction_id, None)
 
 class SumFilter:
     def __init__(self):
