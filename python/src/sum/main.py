@@ -1,7 +1,13 @@
 import os
 import logging
 import hashlib
-
+import threading
+import signal
+from control_plane.transaction.transactions import TransactionsMonitor
+from control_plane.transaction.active_transactions import MastersRoutingKeyByTransactionId
+from digest import DigestPool
+from control_plane.control_plane_sender import ControlPlaneSender
+from control_plane.control_plane_receiver import ControlPlaneReceiver
 from common import middleware, message_protocol, fruit_item
 
 ID = int(os.environ["ID"])
@@ -12,65 +18,162 @@ SUM_PREFIX = os.environ["SUM_PREFIX"]
 SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
-SUM_CONTROL_ROUTING_KEY = f"{SUM_CONTROL_EXCHANGE}_ALL"
+SUM_CONTROL_ROUTING_KEY = f"{ID}_control_routing_key"
+
 
 class SumFilter:
     def __init__(self):
-        self.data_queue = None
-        self.sum_control_exchange = None
+        self.keep_running = True
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_started = False
+
+        self.control_plane_sender = ControlPlaneSender(MOM_HOST, SUM_CONTROL_EXCHANGE, SUM_AMOUNT)
+        self.transactions_monitor = TransactionsMonitor()
+        self.digest_pool = DigestPool()
+        self.masters_routing_key_by_transaction_id = MastersRoutingKeyByTransactionId()
+        self.control_sender_thread = None
+        self.control_receiver_thread = None
+        self.data_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
+
         self.data_output_exchanges = []
         for i in range(AGGREGATION_AMOUNT):
             data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             )
             self.data_output_exchanges.append(data_output_exchange)
-        self.amount_by_client_id_by_fruit = {}
 
-    def process_control_message(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 1:
-            [client_id] = fields
-            self._process_eof(client_id)
-        else:
-            logging.error(f"Received a control message with an unexpected format: {message}")
-        ack()
+        self.control_plane_receiver = ControlPlaneReceiver(
+            MOM_HOST,
+            SUM_CONTROL_EXCHANGE,
+            SUM_CONTROL_ROUTING_KEY,
+            self.control_plane_sender,
+            self.transactions_monitor,
+            self.digest_pool,
+            self.masters_routing_key_by_transaction_id,
+            self.data_output_exchanges,
+            self._calculate_routing_key,
+        )
 
-    def process_data_message(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 3:
-            self._process_data(*fields)
-        elif len(fields) == 1:
-            client_id = fields[0]
-            self._broadcast_eof_to_other_sums(client_id)
-        else:
-            logging.error(f"Received a message with an unexpected format: {message}")
-        ack()
+    def request_shutdown(self):
+        with self._shutdown_lock:
+            if self._shutdown_started:
+                return
+            self._shutdown_started = True
+            self.keep_running = False
 
-    def start(self):
-        with middleware.SharedChannelAdapter(MOM_HOST) as shared_adapter:
-            self.data_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-                MOM_HOST,
-                INPUT_QUEUE,
-                shared_adapter=shared_adapter,
-            )
-            self.sum_control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-                MOM_HOST,
-                SUM_CONTROL_EXCHANGE,
-                [SUM_CONTROL_ROUTING_KEY],
-                shared_adapter=shared_adapter,
-            )
-            self.data_queue.start_consuming(self.process_data_message)
-            self.sum_control_exchange.start_consuming(self.process_control_message)
+        try:
+            self.data_queue.stop_consuming()
+        except Exception as error:
+            logging.debug("Error stopping data consumer: %s", error)
 
+        try:
+            self.control_plane_receiver.stop()
+        except Exception as error:
+            logging.debug("Error stopping control receiver: %s", error)
+
+        try:
+            self.control_plane_sender.stop()
+        except Exception as error:
+            logging.debug("Error stopping control sender: %s", error)
 
     def _process_data(self, fruit_name, amount, client_id):
-        if client_id not in self.amount_by_client_id_by_fruit:
-            self.amount_by_client_id_by_fruit[client_id] = {}
-        if fruit_name not in self.amount_by_client_id_by_fruit[client_id]:
-            self.amount_by_client_id_by_fruit[client_id][fruit_name] = fruit_item.FruitItem(fruit_name, int(amount))
-            return
-        new_fruit_addition = fruit_item.FruitItem(fruit_name, int(amount))
-        self.amount_by_client_id_by_fruit[client_id][fruit_name] = self.amount_by_client_id_by_fruit[client_id][fruit_name] + new_fruit_addition 
+        self.digest_pool.digest_client_data(client_id, fruit_name, int(amount))
+        master_routing_key = (
+            self.masters_routing_key_by_transaction_id.look_master_routing_key(client_id)
+        )
+        if master_routing_key:
+            self.control_plane_sender._enqueue_control_direct(
+                master_routing_key,
+                message_protocol.internal.make_trying_ready(
+                    transaction_id=client_id,
+                    amount_fruits_processed=1,
+                ),
+            )
+
+    def _process_data_eof(self, client_id, total_serialized_data_messages):
+        logging.info(
+            "Received EOF from client %s with total serialized data messages: %s",
+            client_id,
+            total_serialized_data_messages,
+        )
+
+        self.transactions_monitor.begin_transaction(
+            client_id,
+            int(total_serialized_data_messages),
+        )
+
+        master_routing_key = SUM_CONTROL_ROUTING_KEY
+        self.masters_routing_key_by_transaction_id.register_transaction_master_routing_key(
+            client_id,
+            master_routing_key,
+        )
+
+        self.control_plane_sender._enqueue_control_broadcast(
+            message_protocol.internal.make_commit(
+                transaction_id=client_id,
+                master_routing_key=master_routing_key,
+            )
+        )
+        self.control_plane_receiver.maybe_broadcast_ok(client_id)
+
+    def _process_data_message(self, message, ack, nack):
+        try:
+            fields = message_protocol.internal.deserialize(message)
+            if len(fields) == 3:
+                self._process_data(*fields)
+            elif len(fields) == 2:
+                [client_id, total_serialized_data_messages] = fields
+                self._process_data_eof(client_id, total_serialized_data_messages)
+            else:
+                logging.error("Received a message with an unexpected format: %s", message)
+            ack()
+        except Exception as error:
+            if not self.keep_running:
+                nack()
+                return
+            logging.error("Error while processing data message: %s", error)
+            nack()
+
+    def start(self):
+        try:
+            self.control_sender_thread = threading.Thread(
+                target=self.control_plane_sender.run,
+                daemon=False,
+                name=f"sum-{ID}-control-sender",
+            )
+            self.control_sender_thread.start()
+
+            self.control_receiver_thread = threading.Thread(
+                target=self.control_plane_receiver.run,
+                daemon=False,
+                name=f"sum-{ID}-control-receiver",
+            )
+            self.control_receiver_thread.start()
+
+            self.data_queue.start_consuming(self._process_data_message)
+            return 0
+        except Exception as error:
+            if not self.keep_running:
+                return 0
+            logging.error("Error in sum main loop: %s", error)
+            return 1
+        finally:
+            self.request_shutdown()
+
+            if self.control_receiver_thread is not None:
+                self.control_receiver_thread.join()
+            if self.control_sender_thread is not None:
+                self.control_sender_thread.join()
+
+            try:
+                self.data_queue.close()
+            except Exception as error:
+                logging.debug("Error closing data queue: %s", error)
+
+            try:
+                self.control_plane_receiver.close()
+            except Exception as error:
+                logging.debug("Error closing control receiver exchange: %s", error)
 
     def _calculate_routing_key(self, fruit_name, client_id):
         assert AGGREGATION_AMOUNT > 0, "AGGREGATION_AMOUNT must be greater than 0 to calculate routing key"
@@ -80,37 +183,17 @@ class SumFilter:
         return hash_value % AGGREGATION_AMOUNT
 
 
-    def _share_client_fruit_sums_one_by_one_to_aggs(self, client_id):
-        fruit_items_by_client_id = self.amount_by_client_id_by_fruit.get(client_id, {})
-        for final_fruit_item in fruit_items_by_client_id.values():
-            logging.info("  fruit: %s, amount: %d", final_fruit_item.fruit, final_fruit_item.amount)
-            exchange_to_use_idx = self._calculate_routing_key(final_fruit_item.fruit, client_id)
-            self.data_output_exchanges[exchange_to_use_idx].send(
-                message_protocol.internal.serialize(
-                    [final_fruit_item.fruit, final_fruit_item.amount, client_id]
-                )
-            )
-            logging.info(f"   Sending to {self.data_output_exchanges[exchange_to_use_idx].exchange_name}")
-
-    def _process_eof(self, client_id):
-        self._share_client_fruit_sums_one_by_one_to_aggs(client_id)
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([client_id]))
-
-    def _broadcast_eof_to_other_sums(self, client_id):
-        if self.sum_control_exchange is None:
-            logging.error("Cannot broadcast EOF: sum control exchange is not initialized")
-            return
-        self.sum_control_exchange.send(
-            message_protocol.internal.serialize([client_id])
-        )
-
-
 def main():
     logging.basicConfig(level=logging.INFO)
     sum_filter = SumFilter()
-    sum_filter.start()
-    return 0
+
+    def _handle_sigterm(signum, frame):
+        del signum, frame
+        logging.info("SIGTERM received, starting graceful shutdown")
+        sum_filter.request_shutdown()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    return sum_filter.start()
 
 
 if __name__ == "__main__":

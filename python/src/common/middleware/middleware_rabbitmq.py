@@ -35,6 +35,11 @@ def call_function_with_error_mapping(func, *args, **kwargs):
             f"Failed to execute RabbitMQ operation: {str(error)}"
         ) from error
 
+
+def request_stop_consuming_threadsafe(connection, channel):
+    if connection and connection.is_open and channel and channel.is_open:
+        connection.add_callback_threadsafe(channel.stop_consuming)
+
 class SharedChannelAdapter:
     def __init__(self, host):
         self.host = host
@@ -65,6 +70,8 @@ class SharedChannelAdapter:
         self._ready_count += 1
         # Solo arranca cuando todos los registrados llamaron a start_consuming
         if self._ready_count == self._registered_count:
+            if self.channel is None:
+                raise MessageMiddlewareCloseError("Cannot start consuming: Channel is not initialized")
             for func in self._setup_functions:
                 func(self.channel)
             call_function_with_error_mapping(self.channel.start_consuming)
@@ -126,11 +133,13 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
             self.channel.start_consuming()
 
     def stop_consuming(self):
-        operation = lambda ch: ch.stop_consuming()
         if self.shared_adapter:
-            self.shared_adapter.execute_operation(operation)
-        elif self.channel and self.channel.is_open:
-            operation(self.channel)
+            request_stop_consuming_threadsafe(
+                self.shared_adapter.connection,
+                self.shared_adapter.channel,
+            )
+        else:
+            request_stop_consuming_threadsafe(self.connection, self.channel)
 
     def send(self, message):
         operation = lambda ch: ch.basic_publish(exchange='', routing_key=self.queue_name, body=message)
@@ -205,11 +214,13 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
             self.channel.start_consuming()
 
     def stop_consuming(self):
-        operation = lambda ch: ch.stop_consuming()
         if self.shared_adapter:
-            self.shared_adapter.execute_operation(operation)
-        elif self.channel and self.channel.is_open:
-            operation(self.channel)
+            request_stop_consuming_threadsafe(
+                self.shared_adapter.connection,
+                self.shared_adapter.channel,
+            )
+        else:
+            request_stop_consuming_threadsafe(self.connection, self.channel)
 
     def send(self, message):
         def operation(ch):

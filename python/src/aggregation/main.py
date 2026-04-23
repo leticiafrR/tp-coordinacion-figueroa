@@ -1,6 +1,8 @@
 import os
 import logging
 import heapq
+import threading
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -17,6 +19,10 @@ TOP_SIZE = int(os.environ["TOP_SIZE"])
 class AggregationFilter:
 
     def __init__(self):
+        self.keep_running = True
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_started = False
+
         self.input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{ID}"]
         )
@@ -78,25 +84,72 @@ class AggregationFilter:
         logging.info(f"Top fruits for client: {fruit_chunk}")
         return [(fi.fruit, fi.amount) for fi in fruit_chunk]
 
+    def request_shutdown(self):
+        with self._shutdown_lock:
+            if self._shutdown_started:
+                return
+            self._shutdown_started = True
+            self.keep_running = False
+
+        try:
+            self.input_exchange.stop_consuming()
+        except Exception as error:
+            logging.debug("Error stopping aggregation input consumer: %s", error)
+
     def process_messsage(self, message, ack, nack):
-        logging.info("Process message")
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 3:
-            self._process_data(*fields)
-        elif len(fields) == 1:
-            self._process_eof(*fields)
-        else:
-            logging.error(f"Received a message with an unexpected format: {message}")
-        ack()
+        try:
+            logging.info("Process message")
+            fields = message_protocol.internal.deserialize(message)
+            if len(fields) == 3:
+                self._process_data(*fields)
+            elif len(fields) == 1:
+                self._process_eof(*fields)
+            else:
+                logging.error(f"Received a message with an unexpected format: {message}")
+            ack()
+        except Exception as error:
+            if not self.keep_running:
+                try:
+                    nack()
+                except Exception:
+                    pass
+                return
+            logging.error("Error while processing aggregation message: %s", error)
+            nack()
 
     def start(self):
-        self.input_exchange.start_consuming(self.process_messsage)
+        try:
+            self.input_exchange.start_consuming(self.process_messsage)
+            return 0
+        except Exception as error:
+            if not self.keep_running:
+                return 0
+            logging.error("Error in aggregation main loop: %s", error)
+            return 1
+        finally:
+            self.request_shutdown()
+
+            try:
+                self.input_exchange.close()
+            except Exception as error:
+                logging.debug("Error closing aggregation input exchange: %s", error)
+
+            try:
+                self.output_queue.close()
+            except Exception as error:
+                logging.debug("Error closing aggregation output queue: %s", error)
 
 def main():
     logging.basicConfig(level=logging.INFO)
     aggregation_filter = AggregationFilter()
-    aggregation_filter.start()
-    return 0
+
+    def _handle_sigterm(signum, frame):
+        del signum, frame
+        logging.info("SIGTERM received, starting graceful shutdown")
+        aggregation_filter.request_shutdown()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    return aggregation_filter.start()
 
 
 if __name__ == "__main__":
