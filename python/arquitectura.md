@@ -1,328 +1,146 @@
-# Arquitectura final del nodo `sum` (con votación)
+# Informe de arquitectura del sistema (pipeline distribuido)
 
-## Preambulen: Solicitud original vs. cambios de implementación
+## 1) Resumen ejecutivo
 
-### Qué se pidió originalmente
+Este sistema implementa un pipeline distribuido para procesar datasets de frutas por cliente, agregando resultados de forma determinística y tolerando despliegue con réplicas en etapas intermedias.
 
-El prompt original solicitaba implementar un sistema de votación coordinado entre réplicas de `sum` para determinar **cuándo flushear datos a aggregators**. Se especificaba:
+Flujo de alto nivel:
 
-1. **3 threads independientes:** data-plane consumer, control-plane receiver, control-plane sender.
-2. **4 estructuras principales:** `VotationsMonitor`, `VotationStatus`, `DigestPool`, `ClientDigest`, `MastersRoutingKeyByVotationID`.
-3. **3 mensajes de control:** `Commit`, `TryingReady`, `Ok`.
-4. **Comportamiento esperado:** 
-   - Registro de votación al EOF
-   - Broadcast de `Commit` con master
-   - Envío directo de `TryingReady` al master
-   - Evaluación de completitud en el master
-   - Flush tras recibir `Ok`
-   - Mantener el routing por hash hacia aggregators
+1. `client` lee CSV y envía datos al sistema.
+2. `gateway` recibe conexiones de clientes y publica eventos al broker.
+3. `sum` consume eventos, coordina réplicas y decide el momento de flush a los nodos de *aggregation*.
+4. `aggregation` consolida y calcula el top solicitado.
+5. `join` arma respuesta final por cliente y la retorna vía `gateway`.
 
-### Cambios emergentes durante la implementación
+El middleware de mensajería es RabbitMQ y la comunicación se divide en:
 
-Durante la codificación surgieron **problemas de sincronización no explícitamente resueltos en el prompt original**, que requirieron decisiones de diseño adicionales:
-
-1. **Orden del protocolo que evita carreras** → no requiere buffer para `TryingReady`.
-2. **Evitar múltiples broadcasts de `Ok`** → solución: campo `ok_broadcasted` en `VotationStatus`.
-3. **Garantizar idempotencia de limpieza por cliente** → solución: patron de liberación uniforme en todos los replicas.
-
-Las secciones siguientes documentan la arquitectura final, con **énfasis en estos cambios emergentes** a través de seguimientos específicos.
-
+- **Data plane:** mensajes de datos y EOF funcionales.
+- **Control plane:** coordinación interna de réplicas `sum` (`Commit`, `TryingReady`, `Ok`).
 
 ---
 
-## 1) Descripción general de la arquitectura final
+## 2) Componentes y responsabilidades
 
-Implementada en `python/src/sum/main.py`.
+### `client`
 
-### 1.1 Threads del nodo `sum` (según especificación original)
+- Lee `INPUT_FILE`.
+- Envía registros al `gateway`.
+- Espera y guarda salida en `OUTPUT_FILE`.
 
-Cada instancia `sum(ID)` usa tres threads lógicos:
+### `gateway`
 
-1. **Data plane consumer thread**
-   - Consume `INPUT_QUEUE` (mensajes provenientes de `gateway`).
-   - Procesa:
-     - `FruitData` (representado en el wire como `[fruit, amount, client_id]`),
-     - `Eof` (`[client_id, total_serialized_data_messages]`).
+- Expone endpoint de entrada/salida para clientes.
+- Publica datos de entrada a la cola de procesamiento.
+- Reenvía resultados finales de vuelta al cliente correspondiente.
 
-2. **Control plane receiver thread**
-   - Consume `SUM_CONTROL_EXCHANGE` en su routing key propia: `"{ID}_control_routing_key"`.
-   - Procesa mensajes de control tipados:
-     - `Commit`,
-     - `TryingReady`,
-     - `Ok`.
+### `sum` (coordinado entre réplicas)
 
-3. **Control plane sender thread**
-   - Drena una cola interna `Queue`.
-   - Envía mensajes de control:
-     - **broadcast** a todas las routing keys `"{sum_id}_control_routing_key"`,
-     - **directo** a una routing key particular.
+- Acumula conteos por cliente y fruta (`DigestPool`).
+- Coordina réplica master por transacción para decidir cuándo cerrar el lote.
+- Envia resultados parciales a `aggregation` empleando hash de ruteo.
 
-> Restricción respetada: no se usa `shared_adapter`; cada extremo de middleware usa su propio channel/conexión.
+### `aggregation`
 
----
+- Recibe pares agregados por fruta/cliente desde `sum`.
+- Consolida información recibida entre réplicas.
+- Emite resultados hacia `join`.
 
-### 1.2 Estructuras sincronizadas (según especificación original)
+### `join`
 
-1. **`DigestPool`**
-   - Mapa `client_id -> ClientDigest`.
-   - `ClientDigest` contiene:
-     - `cant_data_processed`,
-     - `data_per_fruit` (acumulado por fruta).
+- Reúne resultados provenientes de `aggregation`.
+- Ensambla respuesta final por cliente.
+- Publica resultado en la cola de salida consumida por `gateway`.
 
-2. **`VotationsMonitor`**
-   - Mapa `votation_id(client_id) -> VotationStatus`.
-   - `VotationStatus` contiene:
-     - `expected_processed_data_count`,
-     - `current_processed_data_count`.
+### `rabbitmq`
 
-3. **`MastersRoutingKeyByVotationID`**
-   - Mapa `votation_id -> master_routing_key`.
-   - Permite enviar `TryingReady` al maestro de la votación.
+- Transporte de mensajes para data plane y control plane.
+- Permite desacople entre productores y consumidores.
 
 ---
 
-### 1.3 Protocolo de control (según especificación original)
+## 3) Flujo funcional de extremo a extremo
 
-Helpers agregados en `python/src/common/message_protocol/internal.py`:
-
-- `make_commit(votation_ID, master_routing_key)`
-- `make_trying_ready(votation_ID, amount_fruits_processed)`
-- `make_ok(votation_ID)`
-- `get_control_message_type(message)`
-
-Formato simple: diccionario JSON con campo discriminador `_control_message_type`.
-
----
-
-## 2) Cambios emergentes: decisiones de implementación no pedidas explícitamente
-
-Con la especificación original se podía implementar el flujo de votación sin tocar al resto del sistema, pero durante la codificación aparecieron decisiones de robustez que **no estaban escritas de forma explícita** en el prompt.
-
-La más importante es la siguiente: en la solución actual, la supuesta carrera entre `TryingReady` y el registro de la votación **no es un problema funcional**.
-
-- `sum_0` recibe `EOF` por el plano de datos.
-- `sum_0` registra la votación.
-- Recién después emite `Commit` por broadcast.
-- Los otros `sum` solo generan `TryingReady` cuando ya recibieron ese `Commit`.
-
-Por lo tanto, un `TryingReady` no puede originarse antes de que el master haya registrado la votación. En la implementación actual no se necesita buffer adicional para ese caso.
-
-### 2.1 Decisión adicional: no agregar buffer innecesario
-
-**Decisión de diseño:**
-
-Como el orden del protocolo ya garantiza que el master registra la votación antes de que cualquier réplica emita `TryingReady`, se decidió no agregar una estructura adicional para tolerancia de progreso tardío.
-
-Esto simplifica la implementación y deja explícito que la corrección depende del orden del flujo, no de una memoria auxiliar.
-
-### 2.2 Problema: Múltiples broadcasts de `Ok` por la misma votación
-
-**Contexto del problema:**
-
-En el master, la condición `if current_processed_data_count >= expected_processed_data_count:` podría ser verdadera en múltiples invocaciones de `add_processed_data_count`.
-
-Si varios `TryingReady` llegan muy juntos,uno podría activar el condition y luego otro podría hacerlo nuevamente:
-
-```python
-# En el master, al recibir TryingReady:
-add_processed_data_count(...)
-if digestion_complete(...):  # ← Puede ser cierto varias veces
-    enqueue_ok_broadcast(...)  # ← Se encola múltiple
-```
-
-**Resultado:** `Ok` se envía más de una vez, desperdiciando recursos y complicando idempotecia.
-
-### 2.3 Solución: Campo `ok_broadcasted` en `VotationStatus`
-
-**Decisión de diseño (NO explícitamente pedida):**
-
-Se agregó a `VotationStatus`:
-
-```python
-ok_broadcasted = False
-```
-
-**Flujo de protección:**
-
-1. En el master, al recibir `TryingReady`:
-   ```python
-   if digestion_complete(votation_id) and not votation_status.ok_broadcasted:
-       votation_status.ok_broadcasted = True
-       enqueue_ok_broadcast(votation_id)
-   ```
-
-2. Una sola emisión de `Ok`, sin importar cuántos `TryingReady` se acumulen.
-
-**Invariante establecida:** cada votación emite `Ok` **exactamente una vez**.
+1. `client` envía `FruitData` y EOF lógico asociado al cliente.
+2. `gateway` publica hacia la cola de entrada de `sum`.
+3. Cada réplica `sum` digiere datos localmente por `client_id`.
+4. Ante EOF, se inicia coordinación de cierre por transacción en `sum`:
+   - se define master,
+   - se broadcastea `Commit`,
+   - cada réplica reporta progreso con `TryingReady`.
+5. El master emite `Ok` al detectar completitud.
+6. Todas las réplicas `sum` flushean su digest a `aggregation`.
+7. `aggregation` procesa y envía a `join`.
+8. `join` consolida y publica resultado final.
+9. `gateway` devuelve la respuesta al cliente.
 
 ---
 
-## 3) Flujo nominal de una votación (cliente `C`) con cambios integrados
+## 4) Coordinación de réplicas en `sum`
 
-1. **Digestión de datos**
-   - Cada `sum` que recibe `[fruit, amount, C]` actualiza `DigestPool`.
-   - Si ya conoce el master de `C`, envía `TryingReady(C, 1)` directo al master.
-   - Si **no** conoce el master (aún no llegó `Commit`), el sistema conserva ese progreso en la lógica interna de tolerancia.
+Cada nodo `sum` ejecuta tres loops lógicos:
 
-2. **Inicio de votación al EOF en el master**
-   - Master recibe `EOF(C, total)`:
-   - Registra `VotationStatus(expected=total)`.
-   - **[CAMBIO EMERGENTE]** Deja preparado el contexto de la votación para cualquier progreso ya acumulado por la lógica interna.
-     - Se autodefine master (`"{ID}_control_routing_key"`) para esa votación.
-     - Emite `Commit(C, master_routing_key)` por broadcast.
+1. **Data-plane consumer:** consume cola de entrada (`INPUT_QUEUE`).
+2. **Control-plane receiver:** consume mensajes de control en `SUM_CONTROL_EXCHANGE`.
+3. **Control-plane sender:** drena una cola interna y publica control de forma serializada.
 
-3. **Recepción de `Commit` en otras réplicas**
-   - Guardan `master_routing_key` para `C`.
-   - Leen su digest local actual (`cant_data_processed`) y envían `TryingReady(C, cant_data_processed)` al master.
+Estado por transacción (`client_id`):
 
-4. **Agregación de progreso en el master**
-   - Al recibir cada `TryingReady`:
-   - Si `VotationStatus` NO existe: **[CAMBIO EMERGENTE]** conserva el progreso en la estructura interna de tolerancia.
-     - Si existe: suma a `current_processed_data_count`.
-     - **[CAMBIO EMERGENTE]** Si `digestion_complete()` y NO se ha `ok_broadcasted`:
-       - Set `ok_broadcasted = True`.
-       - Emite `Ok(C)` broadcast.
+- `DigestPool`: acumulación local por fruta y contador de ítems procesados.
+- `TransactionsMonitor`: conteo esperado vs procesado para decidir completitud.
+- `MastersRoutingKeyByTransactionId`: mapeo de master activo por transacción.
 
-5. **Flush al recibir `Ok` (todas las réplicas)**
-   - Cada réplica toma `data_per_fruit` de `C`.
-   - Para cada fruta aplica el **mismo hash histórico**:
-     - `sha256(f"{fruit}:{client_id}") % AGGREGATION_AMOUNT`.
-   - Envía `[fruit, amount, client_id]` al `aggregation` correspondiente.
-   - Luego envía EOF `[client_id]` a **cada** `aggregation`.
-   - **[CAMBIO EMERGENTE]** Ejecuta limpieza uniforme de estado residual de `C`.
+Protocolo principal:
+
+1. El master inicia transacción con `Commit(transaction_id, master_routing_key)`.
+2. Réplicas responden `TryingReady(transaction_id, amount_fruits_processed)`.
+3. Nuevos datos post-`Commit` también emiten `TryingReady(..., 1)`.
+4. El master evalúa completitud y emite `Ok(transaction_id)` cuando `processed_count == expected_count`
+
+
+
+5. Con `Ok`, cada réplica hace flush a `aggregation`, envía EOF a todas las colas de aggregation y limpia estado local.
 
 ---
 
-## 4) Seguimientos de cambios emergentes y liberación de recursos por cliente
+## 5) Cierre limpio en los `sum`
 
-### Seguimiento 1: Orden del protocolo que evita buffer adicional
+En esta sección procedemos a explicar brevemente el proceso que se sigue para apagar correctamente los procesos sums, los demás nodos del sistema no requieren un lógica compleja para llegar al grafecul shutdown dado que el único recurso bloqueante que se usa son los middlewares (aqui no se requiere una comunicación tan fuerte). Por otro lado, gran parte del procedimiento seguido para realizar shutdown se basó al código preexistente que ya contaba con un graceful shutdown (clients y gateway) así mismo como lo discutido en clases en retrospectiva al tp0.
 
-**Contexto:** `SUM_AMOUNT=3`, cliente `C`.
+### 5.1 Cómo se realiza
 
-**Lectura correcta del flujo actual:**
+El cierre limpio se centraliza en `request_shutdown()` del nodo `sum` y es idempotente:
 
-1. `sum_0` recibe EOF por el plano de datos.
-2. `sum_0` registra la votación.
-3. `sum_0` emite `Commit` por broadcast.
-4. Los demás `sum` solo generan `TryingReady` después de recibir ese `Commit`.
+- usa lock (`_shutdown_lock`) y flag (`_shutdown_started`) para ejecutar el cierre una sola vez;
+- desactiva el loop principal (`keep_running = False`);
+- detiene consumo de data plane (`data_queue.stop_consuming()`);
+- detiene control plane receiver (`control_plane_receiver.stop()`);
+- detiene control plane sender (`control_plane_sender.stop()`), lo que desbloquea su loop interno;
+- finalmente, el main thread de sum espera finalización de threads (`join`) y luego cierra recursos de mensajería.
 
-Por lo tanto, en la implementación actual no hay una carrera funcional entre `TryingReady` y el registro de la votación en el master.
+### 5.2 En qué momento ocurre
 
-**Qué documenta este seguimiento:**
+El cierre se dispara en dos caminos principales:
 
-- el orden del protocolo ya resuelve el caso,
-- no fue necesario agregar un buffer intermedio.
+1. **Cierre esperado (graceful):**
+   - recepción de `SIGTERM` (handler registrado en `main()`), o
+   - salida natural del flujo de ejecución que entra al bloque `finally`.
 
-**Resultado:** la solución no necesita apoyarse en un desorden entre `Commit` y `TryingReady`; el orden del protocolo ya evita ese caso.
+2. **Cierre por error (no esperado):**
+   - excepción en `start()` con `keep_running` todavía en `True`.
+   - se loguea error y se retorna código `1`, pero igual se ejecuta limpieza en `finally`.
 
----
+### 5.3 Qué provoca y cómo se maneja
 
-### Seguimiento 2: Protección contra múltiples broadcasts de `Ok` (Campo `ok_broadcasted`)
+Efectos del cierre limpio:
 
-**Contexto:** `SUM_AMOUNT=2`, cliente `D`, master es `sum_0`.
+- evita nuevos envíos al sender de control (`_stopped = True`);
+- corta consumidores de RabbitMQ para no seguir recibiendo mensajes;
+- evita fugas de recursos cerrando exchanges/colas;
+- reduce condiciones de carrera con estrategia de parada única + joins.
 
-**Timeline:**
 
-1. `sum_0` ya tiene `VotationStatus(D)` registrada con `expected = 60`, `current = 0`.
-2. Llegan en ráfaga rápida dos mensajes:
-   - `TryingReady(D, 30)` de `sum_0` self.
-   - `TryingReady(D, 30)` de `sum_1`.
 
-**Sin campo `ok_broadcasted`:**
+## 6) Requisitos de runtime
 
-```python
-# Procesando TryingReady(D, 30) de sum_0:
-add_processed_data_count(30, D)  # current = 30
-if digestion_complete(D):  # 30 >= 60? NO
-    enqueue_ok_broadcast(D)
+**Versión mínima recomendada de python: Python 3.13+**: el nodo `sum` usa `queue.Queue.shutdown()` y el tipo `queue.ShutDown` para finalizar el sender de control de forma segura. Estas APIs no están disponibles en versiones antiguas de Python.
 
-# Procesando TryingReady(D, 30) de sum_1:
-add_processed_data_count(30, D)  # current = 60
-if digestion_complete(D):  # 60 >= 60? SÍ
-    enqueue_ok_broadcast(D)  # ← Se encola Ok
-```
-
-Si el timing fuera distinto (ej: dos TryingReady pequeños acumulados):
-
-```
-# Procesando TryingReady(D, 15):
-add_processed_data_count(15, D)  # current = 45
-if digestion_complete(D): NO
-
-# Procesando TryingReady(D, 15):
-add_processed_data_count(15, D)  # current = 60
-if digestion_complete(D): SÍ → enqueue_ok_broadcast(D)
-
-# Pero si hubiera un tercer mensaje por timeout o reenvío:
-# Procesando TryingReady(D, 0):  (heartbeat/retry)
-add_processed_data_count(0, D)  # current = 60 (no cambia)
-if digestion_complete(D): SÍ → enqueue_ok_broadcast(D)  # ← Duplicado!
-```
-
-**Con campo `ok_broadcasted`:**
-
-```python
-# En VotationStatus:
-ok_broadcasted = False
-
-# Procesando cualquier TryingReady después de alcanzar expected:
-add_processed_data_count(k, D)
-if digestion_complete(D) and not votation_status.ok_broadcasted:
-    votation_status.ok_broadcasted = True
-    enqueue_ok_broadcast(D)  # ← Garantizado una sola vez
-```
-
-**Resultado:** Se emite exactamente un `Ok` por votación, sin importar cuántos `TryingReady` lleguen después de alcanzar `expected`.
-
----
-
-### Seguimiento 3: Liberación uniforme de estado tras completar votación
-
-**Contexto:** Cliente `E`, votación completada con `Ok`.
-
-**Patrón uniforme (mismo en todas las réplicas):**
-
-1. Al recibir `Ok(E)`:
-   - Flush de digest (envío a aggregators).
-   - Limpieza:
-     ```python
-     DigestPool.delete_client_digest(E)
-     VotationsMonitor.delete_votation(E)
-     MastersRoutingKeyByVotationID.delete_votation(E)
-     ```
-
-2. **Invariante:** tras `Ok`, no quedan referencias a `E` en ningún mapa interno de `sum`.
-
-3. **Beneficio:** idempotencia segura; si `Ok` se retransmitiera, no causaría corrupción de estado.
-
----
-
-## 5) Integración de cambios emergentes en el sistema global
-
-Los cambios emergentes (buffer de `TryingReady` y protección `ok_broadcasted`) se integran de forma natural:
-
-1. **Compatibilidad con gateway/aggregation/join:** Cero cambios requeridos. El contrato de mensajes (`FruitData`, `Eof`, y los datos resultantes a `join`) se mantiene idéntico.
-
-2. **Simetría en todas las réplicas:** Tanto master como non-master replicas del mismo `sum` siguen el mismo patrón de flush y limpieza, garantizando uniformidad.
-
-3. **Robustez a desorden:** El buffer previene pérdida de datos por timing adverso, y `ok_broadcasted` previene duplicados de `Ok`.
-
----
-
-## 6) Resumen y comportamiento final
-
-La arquitectura final implementa el protocolo de votación especificado originalmente con **dos extensiones críticas que surgieron por necesidad de sincronización**:
-
-2. **Campo `ok_broadcasted` en `VotationStatus`:**
-   - Protege contra múltiples broadcasts accidentales de `Ok`.
-   - Garantiza exactitud: una sola emisión por votación terminada.
-   - Mantiene la idempotencia de la limpieza posterior.
-
-**Resultado final:**
-
-- ✅ Robustez comprobada en los 5 escenarios (desde 1 cliente hasta 3 replicas paralelas).
-- ✅ Cero cambios en gateway, aggregation, join, client → contrato de datos intacto.
-- ✅ Hash de routing a aggregators persistente (sin cambios).
-- ✅ Limpieza uniforme de estado por cliente → sin residuos tras votación.
-
-Este diseño emergente fue necesario para manejar el asincronismo inherente a la distribución, pero no fue explícitamente especificado en el prompt original; es resultado de análisis profundo de fallos potenciales durante la codificación.
