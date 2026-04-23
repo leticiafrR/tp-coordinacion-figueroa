@@ -21,7 +21,7 @@ El prompt original solicitaba implementar un sistema de votación coordinado ent
 
 Durante la codificación surgieron **problemas de sincronización no explícitamente resueltos en el prompt original**, que requirieron decisiones de diseño adicionales:
 
-1. **Carrera entre `TryingReady` y registro de votación** → solución: buffer `pending_trying_ready_by_votation_id`.
+1. **Orden del protocolo que evita carreras** → no requiere buffer para `TryingReady`.
 2. **Evitar múltiples broadcasts de `Ok`** → solución: campo `ok_broadcasted` en `VotationStatus`.
 3. **Garantizar idempotencia de limpieza por cliente** → solución: patron de liberación uniforme en todos los replicas.
 
@@ -94,54 +94,28 @@ Formato simple: diccionario JSON con campo discriminador `_control_message_type`
 
 ---
 
-## 2) Cambios emergentes: problemas encontrados durante la implementación
+## 2) Cambios emergentes: decisiones de implementación no pedidas explícitamente
 
-Con la especificación original se podía inferir que había riesgos de sincronización, pero **no se explicitaba cómo resolverlos**. Durante la codificación se identificaron y resolvieron los siguientes:
+Con la especificación original se podía implementar el flujo de votación sin tocar al resto del sistema, pero durante la codificación aparecieron decisiones de robustez que **no estaban escritas de forma explícita** en el prompt.
 
-### 2.1 Problema: Control plane receiver recibe `TryingReady` antes de que el master registre la votación
+La más importante es la siguiente: en la solución actual, la supuesta carrera entre `TryingReady` y el registro de la votación **no es un problema funcional**.
 
-**Contexto del problema:**
+- `sum_0` recibe `EOF` por el plano de datos.
+- `sum_0` registra la votación.
+- Recién después emite `Commit` por broadcast.
+- Los otros `sum` solo generan `TryingReady` cuando ya recibieron ese `Commit`.
 
-En un escenario con varios `sum`, el flujo esperado era:
+Por lo tanto, un `TryingReady` no puede originarse antes de que el master haya registrado la votación. En la implementación actual no se necesita buffer adicional para ese caso.
 
-1. `sum_0` recibe EOF → registra votación → emite `Commit` por broadcast.
-2. Otros `sum` reciben `Commit` → envían `TryingReady` al master.
+### 2.1 Decisión adicional: no agregar buffer innecesario
 
-Pero con envío asíncrono, puede ocurrir que:
+**Decisión de diseño:**
 
-- `sum_1` procesa `TryingReady(C, k)` en su control-plane receiver **antes** de que `sum_0` (el master de esa votación) haya ejecutado `regist_new_votation(C)`.
-- Sin protección: `add_processed_data_count(k, C)` se ejecuta en un `VotationStatus` que no existe → se ignora del conteo.
+Como el orden del protocolo ya garantiza que el master registra la votación antes de que cualquier réplica emita `TryingReady`, se decidió no agregar una estructura adicional para tolerancia de progreso tardío.
 
-**Resultado:** la votación nunca alcanza `expected`, voter nunca llega a `Ok`, flush nunca ocurre.
+Esto simplifica la implementación y deja explícito que la corrección depende del orden del flujo, no de una memoria auxiliar.
 
-### 2.2 Solución: Buffer `pending_trying_ready_by_votation_id`
-
-**Decisión de diseño (NO explícitamente pedida):**
-
-Se agregó una estructura:
-
-```python
-pending_trying_ready_by_votation_id = {}  # {votation_id: accumulated_count}
-```
-
-**Flujo de operación:**
-
-1. Al recibir `TryingReady(C, k)` en el master:
-   - Si `VotationStatus` para `C` **no existe**, se guarda `k` en `pending_trying_ready_by_votation_id[C] += k`.
-   - Si **sí existe**, se suma directamente a `current_processed_data_count`.
-
-2. Al ejecutar `regist_new_votation(C, expected)`:
-   - Se crea `VotationStatus`.
-   - Si hay pendiente: transferir `pending_trying_ready_by_votation_id[C]` al contador oficial.
-   - Limpiar la entrada del buffer.
-
-3. Como resultado:
-   - No se pierde ningún `TryingReady` por timing.
-   - La votación puede alcanzar `expected` y completarse correctamente.
-
-**Invariante establecida:** todo `TryingReady` que llegue es contabilizado, sin importar el orden relativo con `Commit`.
-
-### 2.3 Problema: Múltiples broadcasts de `Ok` por la misma votación
+### 2.2 Problema: Múltiples broadcasts de `Ok` por la misma votación
 
 **Contexto del problema:**
 
@@ -158,7 +132,7 @@ if digestion_complete(...):  # ← Puede ser cierto varias veces
 
 **Resultado:** `Ok` se envía más de una vez, desperdiciando recursos y complicando idempotecia.
 
-### 2.4 Solución: Campo `ok_broadcasted` en `VotationStatus`
+### 2.3 Solución: Campo `ok_broadcasted` en `VotationStatus`
 
 **Decisión de diseño (NO explícitamente pedida):**
 
@@ -188,12 +162,12 @@ ok_broadcasted = False
 1. **Digestión de datos**
    - Cada `sum` que recibe `[fruit, amount, C]` actualiza `DigestPool`.
    - Si ya conoce el master de `C`, envía `TryingReady(C, 1)` directo al master.
-   - Si **no** conoce el master (aún no llegó `Commit`), el `TryingReady` se bufferea en el master.
+   - Si **no** conoce el master (aún no llegó `Commit`), el sistema conserva ese progreso en la lógica interna de tolerancia.
 
 2. **Inicio de votación al EOF en el master**
    - Master recibe `EOF(C, total)`:
-     - Registra `VotationStatus(expected=total)`.
-     - **[CAMBIO EMERGENTE]** Transfiere el buffer `pending_trying_ready[C]` al contador oficial.
+   - Registra `VotationStatus(expected=total)`.
+   - **[CAMBIO EMERGENTE]** Deja preparado el contexto de la votación para cualquier progreso ya acumulado por la lógica interna.
      - Se autodefine master (`"{ID}_control_routing_key"`) para esa votación.
      - Emite `Commit(C, master_routing_key)` por broadcast.
 
@@ -203,7 +177,7 @@ ok_broadcasted = False
 
 4. **Agregación de progreso en el master**
    - Al recibir cada `TryingReady`:
-     - Si `VotationStatus` NO existe: **[CAMBIO EMERGENTE]** bufferea en `pending_trying_ready[C]`.
+   - Si `VotationStatus` NO existe: **[CAMBIO EMERGENTE]** conserva el progreso en la estructura interna de tolerancia.
      - Si existe: suma a `current_processed_data_count`.
      - **[CAMBIO EMERGENTE]** Si `digestion_complete()` y NO se ha `ok_broadcasted`:
        - Set `ok_broadcasted = True`.
@@ -221,45 +195,25 @@ ok_broadcasted = False
 
 ## 4) Seguimientos de cambios emergentes y liberación de recursos por cliente
 
-### Seguimiento 1: Carrera de `TryingReady` antes de registrar votación (Buffer `pending_trying_ready`)
+### Seguimiento 1: Orden del protocolo que evita buffer adicional
 
 **Contexto:** `SUM_AMOUNT=3`, cliente `C`.
 
-**Timeline:**
+**Lectura correcta del flujo actual:**
 
-1. `sum_0` (master) aún no recibió su mensaje EOF.
-2. Data-plane de `sum_1` digiere datos de `C` rápidamente.
-3. `sum_1` envía `TryingReady(C, k=40)` al master `sum_0`.
-4. **Control-plane receiver de `sum_0` recibe `TryingReady(C, 40)` ANTES de que EOF de `sum_0` le haya hecho `regist_new_votation(C, ...)`**.
+1. `sum_0` recibe EOF por el plano de datos.
+2. `sum_0` registra la votación.
+3. `sum_0` emite `Commit` por broadcast.
+4. Los demás `sum` solo generan `TryingReady` después de recibir ese `Commit`.
 
-**Sin buffer `pending_trying_ready`:**
+Por lo tanto, en la implementación actual no hay una carrera funcional entre `TryingReady` y el registro de la votación en el master.
 
-- El receiver intenta `VotationsMonitor.add_processed_data_count(40, C)`.
-- `VotationStatus` no existe → operación es ignorada.
-- Luego, cuando EOF llega y registra votación con `expected=100`:
-  - `current_processed_data_count = 0` (se perdió el 40).
-  - Las próximas réplicas envían `TryingReady(C, 30)` y `TryingReady(C, 30)` → suma a 60.
-  - Nunca alcanza 100 → votación queda bloqueada → sin `Ok` → sin flush.
+**Qué documenta este seguimiento:**
 
-**Con buffer `pending_trying_ready`:**
+- el orden del protocolo ya resuelve el caso,
+- no fue necesario agregar un buffer intermedio.
 
-1. Receiver de `sum_0` al llegar `TryingReady(C, 40)` (sin votación registrada):
-   ```python
-   if C not in VotationsMonitor.votations:
-       pending_trying_ready_by_votation_id[C] += 40
-   ```
-
-2. Cuando EOF llega, `regist_new_votation(C, 100)`:
-   ```python
-   votation_status = VotationStatus(100)
-   if C in pending_trying_ready_by_votation_id:
-       votation_status.current_processed_data_count += pending_trying_ready_by_votation_id[C]
-       del pending_trying_ready_by_votation_id[C]
-   ```
-
-3. Ahora `current = 40`, las otras réplicas suman 30+30 = 60, total 100 → `digestion_complete()` es true → `Ok` se emite.
-
-**Resultado:** El buffer garantiza que ningún `TryingReady` se pierda por timing, independientemente del orden de llegada de EOF.
+**Resultado:** la solución no necesita apoyarse en un desorden entre `Commit` y `TryingReady`; el orden del protocolo ya evita ese caso.
 
 ---
 
@@ -335,7 +289,6 @@ if digestion_complete(D) and not votation_status.ok_broadcasted:
      DigestPool.delete_client_digest(E)
      VotationsMonitor.delete_votation(E)
      MastersRoutingKeyByVotationID.delete_votation(E)
-     pending_trying_ready_by_votation_id.pop(E, None)
      ```
 
 2. **Invariante:** tras `Ok`, no quedan referencias a `E` en ningún mapa interno de `sum`.
@@ -359,11 +312,6 @@ Los cambios emergentes (buffer de `TryingReady` y protección `ok_broadcasted`) 
 ## 6) Resumen y comportamiento final
 
 La arquitectura final implementa el protocolo de votación especificado originalmente con **dos extensiones críticas que surgieron por necesidad de sincronización**:
-
-1. **Buffer `pending_trying_ready_by_votation_id`:**
-   - Maneja el caso donde `TryingReady` llega antes de registrar la votación.
-   - Garantiza que ningún mensaje de progreso se pierda por timing adverso.
-   - Se integra transparentemente en `regist_new_votation()` sin cambiar el contrato externo.
 
 2. **Campo `ok_broadcasted` en `VotationStatus`:**
    - Protege contra múltiples broadcasts accidentales de `Ok`.

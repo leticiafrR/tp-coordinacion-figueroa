@@ -138,8 +138,6 @@ class SumFilter:
         self.votations_monitor = VotationsMonitor()
         self.digest_pool = DigestPool()
         self.masters_routing_key_by_votation_id = MastersRoutingKeyByVotationID()
-        self.pending_trying_ready_by_votation_id = {}
-        self.pending_trying_ready_mutex = threading.Lock()
         self.sender_thread = None
         self.data_plane_thread = None
         self.control_receiver_thread = None
@@ -194,21 +192,6 @@ class SumFilter:
             finally:
                 self.control_sender_queue.task_done()
 
-    def _add_pending_trying_ready(self, votation_id, processed_data_count):
-        with self.pending_trying_ready_mutex:
-            current = self.pending_trying_ready_by_votation_id.get(votation_id, 0)
-            self.pending_trying_ready_by_votation_id[votation_id] = (
-                current + int(processed_data_count)
-            )
-
-    def _pop_pending_trying_ready(self, votation_id):
-        with self.pending_trying_ready_mutex:
-            return self.pending_trying_ready_by_votation_id.pop(votation_id, 0)
-
-    def _delete_pending_trying_ready(self, votation_id):
-        with self.pending_trying_ready_mutex:
-            self.pending_trying_ready_by_votation_id.pop(votation_id, None)
-
     def _maybe_broadcast_ok(self, votation_id):
         if self.votations_monitor.mark_ok_as_broadcasted(votation_id):
             self._enqueue_control_broadcast(
@@ -229,7 +212,6 @@ class SumFilter:
         self.digest_pool.delete_client_digest(votation_id)
         self.votations_monitor.delete_votation(votation_id)
         self.masters_routing_key_by_votation_id.delete_votation(votation_id)
-        self._delete_pending_trying_ready(votation_id)
 
     def _process_control_commit(self, message):
         votation_id = message["votation_ID"]
@@ -257,7 +239,9 @@ class SumFilter:
             votation_id,
         )
         if not added:
-            self._add_pending_trying_ready(votation_id, amount_fruits_processed)
+            logging.error(
+                "Received TryingReady for an unknown votation: %s", votation_id
+            )
             return
 
         self._maybe_broadcast_ok(votation_id)
@@ -311,9 +295,6 @@ class SumFilter:
             client_id,
             int(total_serialized_data_messages),
         )
-        pending_count = self._pop_pending_trying_ready(client_id)
-        if pending_count > 0:
-            self.votations_monitor.add_processed_data_count(pending_count, client_id)
 
         master_routing_key = SUM_CONTROL_ROUTING_KEY
         self.masters_routing_key_by_votation_id.regist_votation_master_routing_key(
