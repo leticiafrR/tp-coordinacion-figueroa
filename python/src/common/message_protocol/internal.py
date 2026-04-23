@@ -1,10 +1,14 @@
 import json
 
 
+class ControlMsgType:
+    """Control message type constants, following the pattern of external.MsgType."""
+    OK = 1
+    COMMIT = 2
+    TRYING_READY = 3
+
+
 CONTROL_MSG_TYPE_KEY = "_control_message_type"
-CONTROL_MSG_TYPE_COMMIT = "Commit"
-CONTROL_MSG_TYPE_TRYING_READY = "TryingReady"
-CONTROL_MSG_TYPE_OK = "Ok"
 
 
 def serialize(message):
@@ -29,7 +33,7 @@ def get_control_message_type(message):
 
 def make_commit(transaction_id, master_routing_key):
     return make_control_message(
-        CONTROL_MSG_TYPE_COMMIT,
+        ControlMsgType.COMMIT,
         transaction_id=transaction_id,
         master_routing_key=master_routing_key,
     )
@@ -37,7 +41,7 @@ def make_commit(transaction_id, master_routing_key):
 
 def make_trying_ready(transaction_id, amount_fruits_processed):
     return make_control_message(
-        CONTROL_MSG_TYPE_TRYING_READY,
+        ControlMsgType.TRYING_READY,
         transaction_id=transaction_id,
         amount_fruits_processed=int(amount_fruits_processed),
     )
@@ -45,6 +49,6 @@ def make_trying_ready(transaction_id, amount_fruits_processed):
 
 def make_ok(transaction_id):
     return make_control_message(
-        CONTROL_MSG_TYPE_OK,
+        ControlMsgType.OK,
         transaction_id=transaction_id,
     )

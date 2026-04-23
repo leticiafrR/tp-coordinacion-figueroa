@@ -6,7 +6,9 @@ import queue
 from transaction.transactions import TransactionsMonitor
 from transaction.active_transactions import MastersRoutingKeyByTransactionId
 from digest import DigestPool
+from control_plane_sender import ControlPlaneSender
 from common import middleware, message_protocol, fruit_item
+from common.message_protocol.internal import ControlMsgType
 
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
@@ -18,13 +20,14 @@ AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 SUM_CONTROL_ROUTING_KEY = f"{ID}_control_routing_key"
 
+
 class SumFilter:
     def __init__(self):
-        self.control_sender_queue = queue.Queue()
+        self.control_plane_sender = ControlPlaneSender(MOM_HOST, SUM_CONTROL_EXCHANGE, SUM_AMOUNT)
         self.transactions_monitor = TransactionsMonitor()
         self.digest_pool = DigestPool()
         self.masters_routing_key_by_transaction_id = MastersRoutingKeyByTransactionId()
-        self.sender_thread = None
+        self.control_sender_thread = None
         self.data_plane_thread = None
         self.control_receiver_thread = None
 
@@ -35,56 +38,24 @@ class SumFilter:
             )
             self.data_output_exchanges.append(data_output_exchange)
 
-    def _build_all_sum_control_routing_keys(self):
-        return [f"{sum_id}_control_routing_key" for sum_id in range(SUM_AMOUNT)]
+        # PROPIO del control receiver
+        self.control_handlers = self._make_control_handlers()
 
-    def _enqueue_control_broadcast(self, message):
-        self.control_sender_queue.put({"mode": "broadcast", "message": message})
-
-    def _enqueue_control_direct(self, routing_key, message):
-        self.control_sender_queue.put(
-            {"mode": "direct", "routing_key": routing_key, "message": message}
-        )
-
-    def _run_control_plane_sender(self):
-        all_routing_keys = self._build_all_sum_control_routing_keys()
-        broadcast_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST,
-            SUM_CONTROL_EXCHANGE,
-            all_routing_keys,
-        )
-        direct_exchanges = {
-            routing_key: middleware.MessageMiddlewareExchangeRabbitMQ(
-                MOM_HOST,
-                SUM_CONTROL_EXCHANGE,
-                [routing_key],
-            )
-            for routing_key in all_routing_keys
+    def _make_control_handlers(self):
+        return {
+            ControlMsgType.COMMIT: self._process_control_commit,
+            ControlMsgType.TRYING_READY: self._process_control_trying_ready,
+            ControlMsgType.OK: self._process_control_ok,
         }
-
-        while True:
-            envelope = self.control_sender_queue.get()
-            message = envelope["message"]
-            serialized_message = message_protocol.internal.serialize(message)
-
-            try:
-                if envelope["mode"] == "broadcast":
-                    broadcast_exchange.send(serialized_message)
-                else:
-                    routing_key = envelope["routing_key"]
-                    direct_exchanges[routing_key].send(serialized_message)
-            except Exception as error:
-                logging.error("Failed to send control message: %s", error)
-            finally:
-                self.control_sender_queue.task_done()
 
     def _maybe_broadcast_ok(self, transaction_id):
         if self.transactions_monitor.digestion_complete(transaction_id):
-            self._enqueue_control_broadcast(
-                message_protocol.internal.make_ok(transaction_id=transaction_id)
+            self.control_plane_sender._enqueue_control_broadcast(
+                message_protocol.internal.make_ok(transaction_id)
             )
 
     def _send_digest_to_aggregators(self, transaction_id):
+        # esto es lógica del receiver del control plane
         current_digest = self.digest_pool.get_current_client_digest(transaction_id)
         for fruit_name, amount in current_digest.data_per_fruit.items():
             exchange_to_use_idx = self._calculate_routing_key(fruit_name, transaction_id)
@@ -108,7 +79,7 @@ class SumFilter:
         )
 
         current_digest = self.digest_pool.get_current_client_digest(transaction_id)
-        self._enqueue_control_direct(
+        self.control_plane_sender._enqueue_control_direct(
             master_routing_key,
             message_protocol.internal.make_trying_ready(
                 transaction_id=transaction_id,
@@ -143,14 +114,17 @@ class SumFilter:
                 decoded_message
             )
 
-            if message_type == message_protocol.internal.CONTROL_MSG_TYPE_COMMIT:
-                self._process_control_commit(decoded_message)
-            elif message_type == message_protocol.internal.CONTROL_MSG_TYPE_TRYING_READY:
-                self._process_control_trying_ready(decoded_message)
-            elif message_type == message_protocol.internal.CONTROL_MSG_TYPE_OK:
-                self._process_control_ok(decoded_message)
+            if message_type is None:
+                logging.error("Received message without valid control type: %s", decoded_message)
+                nack()
+                return
+
+            handler = self.control_handlers.get(message_type)
+            if handler:
+                handler(decoded_message)
             else:
-                logging.error("Unexpected control message: %s", decoded_message)
+                logging.error("Unknown control message type: %s", message_type)
+            
             ack()
         except Exception as error:
             logging.error("Error while processing control message: %s", error)
@@ -162,7 +136,7 @@ class SumFilter:
             self.masters_routing_key_by_transaction_id.look_master_routing_key(client_id)
         )
         if master_routing_key:
-            self._enqueue_control_direct(
+            self.control_plane_sender._enqueue_control_direct(
                 master_routing_key,
                 message_protocol.internal.make_trying_ready(
                     transaction_id=client_id,
@@ -188,7 +162,7 @@ class SumFilter:
             master_routing_key,
         )
 
-        self._enqueue_control_broadcast(
+        self.control_plane_sender._enqueue_control_broadcast(
             message_protocol.internal.make_commit(
                 transaction_id=client_id,
                 master_routing_key=master_routing_key,
@@ -224,12 +198,12 @@ class SumFilter:
         control_exchange.start_consuming(self._process_control_message)
 
     def start(self):
-        self.sender_thread = threading.Thread(
-            target=self._run_control_plane_sender,
+        self.control_sender_thread = threading.Thread(
+            target=self.control_plane_sender.run,
             daemon=True,
             name=f"sum-{ID}-control-sender",
         )
-        self.sender_thread.start()
+        self.control_sender_thread.start()
 
         self.control_receiver_thread = threading.Thread(
             target=self._run_control_plane_receiver,
@@ -247,6 +221,7 @@ class SumFilter:
 
         self.control_receiver_thread.join()
         self.data_plane_thread.join()
+        self.control_sender_thread.join()
 
     def _calculate_routing_key(self, fruit_name, client_id):
         assert AGGREGATION_AMOUNT > 0, "AGGREGATION_AMOUNT must be greater than 0 to calculate routing key"
