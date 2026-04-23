@@ -21,7 +21,6 @@ class VotationStatus:
     def __init__(self, expected_processed_data_count):
         self.expected_processed_data_count = int(expected_processed_data_count)
         self.current_processed_data_count = 0
-        self.ok_broadcasted = False
 
 
 class VotationsMonitor:
@@ -53,23 +52,8 @@ class VotationsMonitor:
                 return False
             return (
                 status.current_processed_data_count
-                >= status.expected_processed_data_count
+                == status.expected_processed_data_count
             )
-
-    def mark_ok_as_broadcasted(self, votation_id):
-        with self.mutex:
-            status = self.votations.get(votation_id)
-            if status is None:
-                return False
-            if status.ok_broadcasted:
-                return False
-            if (
-                status.current_processed_data_count
-                < status.expected_processed_data_count
-            ):
-                return False
-            status.ok_broadcasted = True
-            return True
 
     def delete_votation(self, votation_id):
         with self.mutex:
@@ -193,7 +177,7 @@ class SumFilter:
                 self.control_sender_queue.task_done()
 
     def _maybe_broadcast_ok(self, votation_id):
-        if self.votations_monitor.mark_ok_as_broadcasted(votation_id):
+        if self.votations_monitor.digestion_complete(votation_id):
             self._enqueue_control_broadcast(
                 message_protocol.internal.make_ok(votation_ID=votation_id)
             )
