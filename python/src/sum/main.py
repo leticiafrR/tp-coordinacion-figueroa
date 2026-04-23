@@ -38,7 +38,6 @@ class SumFilter:
             )
             self.data_output_exchanges.append(data_output_exchange)
 
-        # PROPIO del control receiver
         self.control_handlers = self._make_control_handlers()
 
     def _make_control_handlers(self):
@@ -55,7 +54,6 @@ class SumFilter:
             )
 
     def _send_digest_to_aggregators(self, transaction_id):
-        # esto es lógica del receiver del control plane
         current_digest = self.digest_pool.get_current_client_digest(transaction_id)
         for fruit_name, amount in current_digest.data_per_fruit.items():
             exchange_to_use_idx = self._calculate_routing_key(fruit_name, transaction_id)
@@ -110,18 +108,21 @@ class SumFilter:
     def _process_control_message(self, message, ack, nack):
         try:
             decoded_message = message_protocol.internal.deserialize(message)
-            message_type = message_protocol.internal.get_control_message_type(
-                decoded_message
-            )
+            if not isinstance(decoded_message, list) or len(decoded_message) == 0:
+                logging.error("Received malformed control message: %s", decoded_message)
+                nack()
+                return
 
-            if message_type is None:
-                logging.error("Received message without valid control type: %s", decoded_message)
+            message_type = message_protocol.internal.get_control_message_type(decoded_message)
+            normalized_message = message_protocol.internal.parse_control_message(decoded_message)
+            if normalized_message is None:
+                logging.error("Received malformed control message: %s", decoded_message)
                 nack()
                 return
 
             handler = self.control_handlers.get(message_type)
             if handler:
-                handler(decoded_message)
+                handler(normalized_message)
             else:
                 logging.error("Unknown control message type: %s", message_type)
             
