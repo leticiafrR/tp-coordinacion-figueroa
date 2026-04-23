@@ -55,7 +55,7 @@ class TransactionsMonitor:
                 == status.expected_processed_data_count
             )
 
-    def delete_votation(self, transaction_id):
+    def delete_transaction(self, transaction_id):
         with self.mutex:
             self.transactions.pop(transaction_id, None)
 
@@ -99,12 +99,12 @@ class DigestPool:
             self.pool.pop(client_id, None)
 
 
-class MastersRoutingKeyByVotationID:
+class MastersRoutingKeyByTransactionId:
     def __init__(self):
         self.routing_key_by_transaction_id = {}
         self.mutex = threading.Lock()
 
-    def regist_votation_master_routing_key(self, transaction_id, routing_key):
+    def register_transaction_master_routing_key(self, transaction_id, routing_key):
         with self.mutex:
             self.routing_key_by_transaction_id[transaction_id] = routing_key
 
@@ -112,16 +112,16 @@ class MastersRoutingKeyByVotationID:
         with self.mutex:
             return self.routing_key_by_transaction_id.get(transaction_id)
 
-    def delete_votation(self, transaction_id):
+    def delete_transaction_info(self, transaction_id):
         with self.mutex:
             self.routing_key_by_transaction_id.pop(transaction_id, None)
 
 class SumFilter:
     def __init__(self):
         self.control_sender_queue = queue.Queue()
-        self.votations_monitor = TransactionsMonitor()
+        self.transactions_monitor = TransactionsMonitor()
         self.digest_pool = DigestPool()
-        self.masters_routing_key_by_transaction_id = MastersRoutingKeyByVotationID()
+        self.masters_routing_key_by_transaction_id = MastersRoutingKeyByTransactionId()
         self.sender_thread = None
         self.data_plane_thread = None
         self.control_receiver_thread = None
@@ -177,7 +177,7 @@ class SumFilter:
                 self.control_sender_queue.task_done()
 
     def _maybe_broadcast_ok(self, transaction_id):
-        if self.votations_monitor.digestion_complete(transaction_id):
+        if self.transactions_monitor.digestion_complete(transaction_id):
             self._enqueue_control_broadcast(
                 message_protocol.internal.make_ok(transaction_id=transaction_id)
             )
@@ -194,13 +194,13 @@ class SumFilter:
             data_output_exchange.send(message_protocol.internal.serialize([transaction_id]))
 
         self.digest_pool.delete_client_digest(transaction_id)
-        self.votations_monitor.delete_votation(transaction_id)
-        self.masters_routing_key_by_transaction_id.delete_votation(transaction_id)
+        self.transactions_monitor.delete_transaction(transaction_id)
+        self.masters_routing_key_by_transaction_id.delete_transaction_info(transaction_id)
 
     def _process_control_commit(self, message):
         transaction_id = message["transaction_id"]
         master_routing_key = message["master_routing_key"]
-        self.masters_routing_key_by_transaction_id.regist_votation_master_routing_key(
+        self.masters_routing_key_by_transaction_id.register_transaction_master_routing_key(
             transaction_id,
             master_routing_key,
         )
@@ -218,13 +218,13 @@ class SumFilter:
         transaction_id = message["transaction_id"]
         amount_fruits_processed = int(message["amount_fruits_processed"])
 
-        added = self.votations_monitor.add_processed_data_count(
+        added = self.transactions_monitor.add_processed_data_count(
             amount_fruits_processed,
             transaction_id,
         )
         if not added:
             logging.error(
-                "Received TryingReady for an unknown votation: %s", transaction_id
+                "Received TryingReady for an unknown transaction: %s", transaction_id
             )
             return
 
@@ -275,13 +275,13 @@ class SumFilter:
             total_serialized_data_messages,
         )
 
-        self.votations_monitor.begin_transaction(
+        self.transactions_monitor.begin_transaction(
             client_id,
             int(total_serialized_data_messages),
         )
 
         master_routing_key = SUM_CONTROL_ROUTING_KEY
-        self.masters_routing_key_by_transaction_id.regist_votation_master_routing_key(
+        self.masters_routing_key_by_transaction_id.register_transaction_master_routing_key(
             client_id,
             master_routing_key,
         )
