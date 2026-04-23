@@ -1,6 +1,5 @@
 import os
 import logging
-import hashlib
 import threading
 import signal
 from control_plane.transaction.transactions import TransactionsMonitor
@@ -178,8 +177,7 @@ class SumFilter:
     def _calculate_routing_key(self, fruit_name, client_id):
         assert AGGREGATION_AMOUNT > 0, "AGGREGATION_AMOUNT must be greater than 0 to calculate routing key"
         key = f"{fruit_name}:{client_id}"
-        digest = hashlib.sha256(key.encode("utf-8")).digest()
-        hash_value = int.from_bytes(digest[:8], byteorder="big", signed=False)
+        hash_value = int.from_bytes(key.encode("utf-8"), byteorder="big", signed=False)
         return hash_value % AGGREGATION_AMOUNT
 
 
