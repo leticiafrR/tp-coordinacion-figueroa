@@ -27,24 +27,24 @@ def get_control_message_type(message):
     return message.get(CONTROL_MSG_TYPE_KEY)
 
 
-def make_commit(votation_ID, master_routing_key):
+def make_commit(transaction_id, master_routing_key):
     return make_control_message(
         CONTROL_MSG_TYPE_COMMIT,
-        votation_ID=votation_ID,
+        transaction_id=transaction_id,
         master_routing_key=master_routing_key,
     )
 
 
-def make_trying_ready(votation_ID, amount_fruits_processed):
+def make_trying_ready(transaction_id, amount_fruits_processed):
     return make_control_message(
         CONTROL_MSG_TYPE_TRYING_READY,
-        votation_ID=votation_ID,
+        transaction_id=transaction_id,
         amount_fruits_processed=int(amount_fruits_processed),
     )
 
 
-def make_ok(votation_ID):
+def make_ok(transaction_id):
     return make_control_message(
         CONTROL_MSG_TYPE_OK,
-        votation_ID=votation_ID,
+        transaction_id=transaction_id,
     )

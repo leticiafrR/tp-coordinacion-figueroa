@@ -17,37 +17,37 @@ AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 SUM_CONTROL_ROUTING_KEY = f"{ID}_control_routing_key"
 
 
-class VotationStatus:
+class TransactionStatus:
     def __init__(self, expected_processed_data_count):
         self.expected_processed_data_count = int(expected_processed_data_count)
         self.current_processed_data_count = 0
 
 
-class VotationsMonitor:
+class TransactionsMonitor:
     def __init__(self):
-        self.votations = {}
+        self.transactions = {}
         self.mutex = threading.Lock()
 
-    def regist_new_votation(self, client_id, expected_data_count):
+    def begin_transaction(self, client_id, expected_data_count):
         with self.mutex:
-            if client_id not in self.votations:
-                self.votations[client_id] = VotationStatus(expected_data_count)
+            if client_id not in self.transactions:
+                self.transactions[client_id] = TransactionStatus(expected_data_count)
             else:
-                self.votations[client_id].expected_processed_data_count = int(
+                self.transactions[client_id].expected_processed_data_count = int(
                     expected_data_count
                 )
 
-    def add_processed_data_count(self, processed_data_count, votation_id):
+    def add_processed_data_count(self, processed_data_count, transaction_id):
         with self.mutex:
-            status = self.votations.get(votation_id)
+            status = self.transactions.get(transaction_id)
             if status is None:
                 return False
             status.current_processed_data_count += int(processed_data_count)
             return True
 
-    def digestion_complete(self, votation_id):
+    def digestion_complete(self, transaction_id):
         with self.mutex:
-            status = self.votations.get(votation_id)
+            status = self.transactions.get(transaction_id)
             if status is None:
                 return False
             return (
@@ -55,9 +55,9 @@ class VotationsMonitor:
                 == status.expected_processed_data_count
             )
 
-    def delete_votation(self, votation_id):
+    def delete_votation(self, transaction_id):
         with self.mutex:
-            self.votations.pop(votation_id, None)
+            self.transactions.pop(transaction_id, None)
 
 
 class ClientDigest:
@@ -101,27 +101,27 @@ class DigestPool:
 
 class MastersRoutingKeyByVotationID:
     def __init__(self):
-        self.routing_key_by_votation_id = {}
+        self.routing_key_by_transaction_id = {}
         self.mutex = threading.Lock()
 
-    def regist_votation_master_routing_key(self, votation_id, routing_key):
+    def regist_votation_master_routing_key(self, transaction_id, routing_key):
         with self.mutex:
-            self.routing_key_by_votation_id[votation_id] = routing_key
+            self.routing_key_by_transaction_id[transaction_id] = routing_key
 
-    def look_master_routing_key(self, votation_id):
+    def look_master_routing_key(self, transaction_id):
         with self.mutex:
-            return self.routing_key_by_votation_id.get(votation_id)
+            return self.routing_key_by_transaction_id.get(transaction_id)
 
-    def delete_votation(self, votation_id):
+    def delete_votation(self, transaction_id):
         with self.mutex:
-            self.routing_key_by_votation_id.pop(votation_id, None)
+            self.routing_key_by_transaction_id.pop(transaction_id, None)
 
 class SumFilter:
     def __init__(self):
         self.control_sender_queue = queue.Queue()
-        self.votations_monitor = VotationsMonitor()
+        self.votations_monitor = TransactionsMonitor()
         self.digest_pool = DigestPool()
-        self.masters_routing_key_by_votation_id = MastersRoutingKeyByVotationID()
+        self.masters_routing_key_by_transaction_id = MastersRoutingKeyByVotationID()
         self.sender_thread = None
         self.data_plane_thread = None
         self.control_receiver_thread = None
@@ -176,63 +176,63 @@ class SumFilter:
             finally:
                 self.control_sender_queue.task_done()
 
-    def _maybe_broadcast_ok(self, votation_id):
-        if self.votations_monitor.digestion_complete(votation_id):
+    def _maybe_broadcast_ok(self, transaction_id):
+        if self.votations_monitor.digestion_complete(transaction_id):
             self._enqueue_control_broadcast(
-                message_protocol.internal.make_ok(votation_ID=votation_id)
+                message_protocol.internal.make_ok(transaction_id=transaction_id)
             )
 
-    def _send_digest_to_aggregators(self, votation_id):
-        current_digest = self.digest_pool.get_current_client_digest(votation_id)
+    def _send_digest_to_aggregators(self, transaction_id):
+        current_digest = self.digest_pool.get_current_client_digest(transaction_id)
         for fruit_name, amount in current_digest.data_per_fruit.items():
-            exchange_to_use_idx = self._calculate_routing_key(fruit_name, votation_id)
+            exchange_to_use_idx = self._calculate_routing_key(fruit_name, transaction_id)
             self.data_output_exchanges[exchange_to_use_idx].send(
-                message_protocol.internal.serialize([fruit_name, amount, votation_id])
+                message_protocol.internal.serialize([fruit_name, amount, transaction_id])
             )
 
         for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([votation_id]))
+            data_output_exchange.send(message_protocol.internal.serialize([transaction_id]))
 
-        self.digest_pool.delete_client_digest(votation_id)
-        self.votations_monitor.delete_votation(votation_id)
-        self.masters_routing_key_by_votation_id.delete_votation(votation_id)
+        self.digest_pool.delete_client_digest(transaction_id)
+        self.votations_monitor.delete_votation(transaction_id)
+        self.masters_routing_key_by_transaction_id.delete_votation(transaction_id)
 
     def _process_control_commit(self, message):
-        votation_id = message["votation_ID"]
+        transaction_id = message["transaction_id"]
         master_routing_key = message["master_routing_key"]
-        self.masters_routing_key_by_votation_id.regist_votation_master_routing_key(
-            votation_id,
+        self.masters_routing_key_by_transaction_id.regist_votation_master_routing_key(
+            transaction_id,
             master_routing_key,
         )
 
-        current_digest = self.digest_pool.get_current_client_digest(votation_id)
+        current_digest = self.digest_pool.get_current_client_digest(transaction_id)
         self._enqueue_control_direct(
             master_routing_key,
             message_protocol.internal.make_trying_ready(
-                votation_ID=votation_id,
+                transaction_id=transaction_id,
                 amount_fruits_processed=current_digest.cant_data_processed,
             ),
         )
 
     def _process_control_trying_ready(self, message):
-        votation_id = message["votation_ID"]
+        transaction_id = message["transaction_id"]
         amount_fruits_processed = int(message["amount_fruits_processed"])
 
         added = self.votations_monitor.add_processed_data_count(
             amount_fruits_processed,
-            votation_id,
+            transaction_id,
         )
         if not added:
             logging.error(
-                "Received TryingReady for an unknown votation: %s", votation_id
+                "Received TryingReady for an unknown votation: %s", transaction_id
             )
             return
 
-        self._maybe_broadcast_ok(votation_id)
+        self._maybe_broadcast_ok(transaction_id)
 
     def _process_control_ok(self, message):
-        votation_id = message["votation_ID"]
-        self._send_digest_to_aggregators(votation_id)
+        transaction_id = message["transaction_id"]
+        self._send_digest_to_aggregators(transaction_id)
 
     def _process_control_message(self, message, ack, nack):
         try:
@@ -257,13 +257,13 @@ class SumFilter:
     def _process_data(self, fruit_name, amount, client_id):
         self.digest_pool.digest_client_data(client_id, fruit_name, int(amount))
         master_routing_key = (
-            self.masters_routing_key_by_votation_id.look_master_routing_key(client_id)
+            self.masters_routing_key_by_transaction_id.look_master_routing_key(client_id)
         )
         if master_routing_key:
             self._enqueue_control_direct(
                 master_routing_key,
                 message_protocol.internal.make_trying_ready(
-                    votation_ID=client_id,
+                    transaction_id=client_id,
                     amount_fruits_processed=1,
                 ),
             )
@@ -275,20 +275,20 @@ class SumFilter:
             total_serialized_data_messages,
         )
 
-        self.votations_monitor.regist_new_votation(
+        self.votations_monitor.begin_transaction(
             client_id,
             int(total_serialized_data_messages),
         )
 
         master_routing_key = SUM_CONTROL_ROUTING_KEY
-        self.masters_routing_key_by_votation_id.regist_votation_master_routing_key(
+        self.masters_routing_key_by_transaction_id.regist_votation_master_routing_key(
             client_id,
             master_routing_key,
         )
 
         self._enqueue_control_broadcast(
             message_protocol.internal.make_commit(
-                votation_ID=client_id,
+                transaction_id=client_id,
                 master_routing_key=master_routing_key,
             )
         )
