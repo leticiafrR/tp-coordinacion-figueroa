@@ -3,11 +3,11 @@ import logging
 import hashlib
 import threading
 import signal
-from transaction.transactions import TransactionsMonitor
-from transaction.active_transactions import MastersRoutingKeyByTransactionId
+from control_plane.transaction.transactions import TransactionsMonitor
+from control_plane.transaction.active_transactions import MastersRoutingKeyByTransactionId
 from digest import DigestPool
-from control_plane_sender import ControlPlaneSender
-from control_plane_receiver import ControlPlaneReceiver
+from control_plane.control_plane_sender import ControlPlaneSender
+from control_plane.control_plane_receiver import ControlPlaneReceiver
 from common import middleware, message_protocol, fruit_item
 
 ID = int(os.environ["ID"])
